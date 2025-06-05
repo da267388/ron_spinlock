@@ -1,0 +1,16 @@
+using qspinlock
+# CONFIG_PARAVIRT_SPINLOCKS is not set
+make ron_spin_lock / ron_spin_unlock be the only way to get lock(no shortcut)
+
+writing TSP_ID_ARRAY in kernel/locking/ron_routing
+proc filesystem kernel/locking/ron_proc
+
+
+
+
+smp: Bringing up secondary CPUs ...
+smpboot: x86: Booting SMP configuration:
+.... node  #0, CPUs:        #2  #4  #6  #8 #10 #12 #14 #16 #18 #2
+BUG: spinlock already unlocked on CPU#4, cpuhp/4/29
+lock: 0xffff9325ddbf9e00, .magic: dead4ead, .owner: cpuhp/4/29,4
+CPU: 4 UID: 0 PID: 29 Comm: cpuhp/4 Not tainted 6.14.0-rc3+ #41
