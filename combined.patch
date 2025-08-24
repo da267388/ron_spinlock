@@ -1,0 +1,2302 @@
+From 4164e9f59352d381bbde9644bc9ed8ff9d78d091 Mon Sep 17 00:00:00 2001
+From: da267388 <hagud65171@gmail.com>
+Date: Mon, 28 Apr 2025 02:42:19 +0800
+Subject: [PATCH 1/3] no paravir
+
+---
+ arch/x86/include/asm/ron_qspinlock.h | 116 +++++
+ include/asm-generic/ron_qspinlock.h  | 117 +++++
+ kernel/locking/ron_proc.c            |  46 ++
+ kernel/locking/ron_qspinlock.c       | 686 +++++++++++++++++++++++++++
+ kernel/locking/ron_qspinlock_.c      | 193 ++++++++
+ kernel/locking/ron_route.c           |  14 +
+ kernel/locking/ron_route.h           |  10 +
+ 7 files changed, 1182 insertions(+)
+ create mode 100644 arch/x86/include/asm/ron_qspinlock.h
+ create mode 100644 include/asm-generic/ron_qspinlock.h
+ create mode 100644 kernel/locking/ron_proc.c
+ create mode 100644 kernel/locking/ron_qspinlock.c
+ create mode 100644 kernel/locking/ron_qspinlock_.c
+ create mode 100644 kernel/locking/ron_route.c
+ create mode 100644 kernel/locking/ron_route.h
+
+diff --git a/arch/x86/include/asm/ron_qspinlock.h b/arch/x86/include/asm/ron_qspinlock.h
+new file mode 100644
+index 000000000000..da5c7246bf62
+--- /dev/null
++++ b/arch/x86/include/asm/ron_qspinlock.h
+@@ -0,0 +1,116 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef _ASM_X86_RON_QSPINLOCK_H
++#define _ASM_X86_RON_QSPINLOCK_H
++
++#include <linux/jump_label.h>
++#include <asm/cpufeature.h>
++#include <asm-generic/qspinlock_types.h>
++#include <asm/paravirt.h>
++#include <asm/rmwcc.h>
++
++#define _Q_PENDING_LOOPS	(1 << 9)
++
++#define queued_fetch_set_pending_acquire queued_fetch_set_pending_acquire
++static __always_inline u32 queued_fetch_set_pending_acquire(struct qspinlock *lock)
++{
++	u32 val;
++
++	/*
++	 * We can't use GEN_BINARY_RMWcc() inside an if() stmt because asm goto
++	 * and CONFIG_PROFILE_ALL_BRANCHES=y results in a label inside a
++	 * statement expression, which GCC doesn't like.
++	 */
++	val = GEN_BINARY_RMWcc(LOCK_PREFIX "btsl", lock->val.counter, c,
++			       "I", _Q_PENDING_OFFSET) * _Q_PENDING_VAL;
++	val |= atomic_read(&lock->val) & ~_Q_PENDING_MASK;
++
++	return val;
++}
++
++#ifdef CONFIG_PARAVIRT_SPINLOCKS
++extern void native_queued_spin_lock_slowpath(struct qspinlock *lock, u32 val);
++extern void __pv_init_lock_hash(void);
++extern void __pv_queued_spin_lock_slowpath(struct qspinlock *lock, u32 val);
++extern void __raw_callee_save___pv_queued_spin_unlock(struct qspinlock *lock);
++extern bool nopvspin;
++
++#define	queued_spin_unlock queued_spin_unlock
++/**
++ * queued_spin_unlock - release a queued spinlock
++ * @lock : Pointer to queued spinlock structure
++ *
++ * A smp_store_release() on the least-significant byte.
++ */
++static inline void native_queued_spin_unlock(struct qspinlock *lock)
++{
++	smp_store_release(&lock->locked, 0);
++}
++
++static inline void queued_spin_lock_slowpath(struct qspinlock *lock, u32 val)
++{
++	pv_queued_spin_lock_slowpath(lock, val);
++}
++
++static inline void queued_spin_unlock(struct qspinlock *lock)
++{
++	kcsan_release();
++	pv_queued_spin_unlock(lock);
++}
++
++#define vcpu_is_preempted vcpu_is_preempted
++static inline bool vcpu_is_preempted(long cpu)
++{
++	return pv_vcpu_is_preempted(cpu);
++}
++#endif
++
++#ifdef CONFIG_PARAVIRT
++/*
++ * virt_spin_lock_key - disables by default the virt_spin_lock() hijack.
++ *
++ * Native (and PV wanting native due to vCPU pinning) should keep this key
++ * disabled. Native does not touch the key.
++ *
++ * When in a guest then native_pv_lock_init() enables the key first and
++ * KVM/XEN might conditionally disable it later in the boot process again.
++ */
++DECLARE_STATIC_KEY_FALSE(virt_spin_lock_key);
++
++/*
++ * Shortcut for the queued_spin_lock_slowpath() function that allows
++ * virt to hijack it.
++ *
++ * Returns:
++ *   true - lock has been negotiated, all done;
++ *   false - queued_spin_lock_slowpath() will do its thing.
++ */
++#define virt_spin_lock virt_spin_lock
++static inline bool virt_spin_lock(struct qspinlock *lock)
++{
++	int val;
++
++	if (!static_branch_likely(&virt_spin_lock_key))
++		return false;
++
++	/*
++	 * On hypervisors without PARAVIRT_SPINLOCKS support we fall
++	 * back to a Test-and-Set spinlock, because fair locks have
++	 * horrible lock 'holder' preemption issues.
++	 */
++
++ __retry:
++	val = atomic_read(&lock->val);
++
++	if (val || !atomic_try_cmpxchg(&lock->val, &val, _Q_LOCKED_VAL)) {
++		cpu_relax();
++		goto __retry;
++	}
++
++	return true;
++}
++
++#endif /* CONFIG_PARAVIRT */
++
++#include <asm-generic/ron_qspinlock.h>
++
++#endif /* _ASM_X86_RON_QSPINLOCK_H */
+diff --git a/include/asm-generic/ron_qspinlock.h b/include/asm-generic/ron_qspinlock.h
+new file mode 100644
+index 000000000000..508f28ccdb31
+--- /dev/null
++++ b/include/asm-generic/ron_qspinlock.h
+@@ -0,0 +1,117 @@
++#ifndef __ASM_GENERRIC_RON_QSPINLOCK_H
++#define __ASM_GENERRIC_RON_QSPINLOCK_H
++
++
++#include <asm-generic/qspinlock_types.h>
++#include <linux/atomic.h>
++
++#ifndef queued_spin_is_locked
++/**
++ * queued_spin_is_locked - is the spinlock locked?
++ * @lock: Pointer to queued spinlock structure
++ * Return: 1 if it is locked, 0 otherwise
++ */
++static __always_inline int queued_spin_is_locked(struct qspinlock *lock)
++{
++	/*
++	 * Any !0 state indicates it is locked, even if _Q_LOCKED_VAL
++	 * isn't immediately observable.
++	 */
++	return atomic_read(&lock->val);
++}
++#endif
++
++/**
++ * queued_spin_value_unlocked - is the spinlock structure unlocked?
++ * @lock: queued spinlock structure
++ * Return: 1 if it is unlocked, 0 otherwise
++ *
++ * N.B. Whenever there are tasks waiting for the lock, it is considered
++ *      locked wrt the lockref code to avoid lock stealing by the lockref
++ *      code and change things underneath the lock. This also allows some
++ *      optimizations to be applied without conflict with lockref.
++ */
++static __always_inline int queued_spin_value_unlocked(struct qspinlock lock)
++{
++	return !lock.val.counter;
++}
++
++/**
++ * queued_spin_is_contended - check if the lock is contended
++ * @lock : Pointer to queued spinlock structure
++ * Return: 1 if lock contended, 0 otherwise
++ */
++static __always_inline int queued_spin_is_contended(struct qspinlock *lock)
++{
++	return atomic_read(&lock->val) & ~_Q_LOCKED_MASK;
++}
++/**
++ * queued_spin_trylock - try to acquire the queued spinlock
++ * @lock : Pointer to queued spinlock structure
++ * Return: 1 if lock acquired, 0 if failed
++ */
++static __always_inline int queued_spin_trylock(struct qspinlock *lock)
++{
++	int val = atomic_read(&lock->val);
++
++	if (unlikely(val))
++		return 0;
++
++	return likely(atomic_try_cmpxchg_acquire(&lock->val, &val, _Q_LOCKED_VAL));
++}
++
++extern void queued_spin_lock_slowpath(struct qspinlock *lock, u32 val);
++extern void ron_spin_lock(struct qspinlock *lock);
++extern void ron_spin_unlock(struct qspinlock *lock);
++
++#ifndef queued_spin_lock
++/**
++ * queued_spin_lock - acquire a queued spinlock
++ * @lock: Pointer to queued spinlock structure
++ */
++static __always_inline void queued_spin_lock(struct qspinlock *lock)
++{
++	int val = 0;
++
++	if (likely(atomic_try_cmpxchg_acquire(&lock->val, &val, _Q_LOCKED_VAL)))
++		return;
++
++	ron_spin_lock(lock);
++}
++#endif
++
++#ifndef queued_spin_unlock
++/**
++ * queued_spin_unlock - release a queued spinlock
++ * @lock : Pointer to queued spinlock structure
++ */
++static __always_inline void queued_spin_unlock(struct qspinlock *lock)
++{
++	/*
++	 * unlock() needs release semantics:
++	 */
++	ron_spin_unlock(lock);
++}
++#endif
++
++#ifndef virt_spin_lock
++static __always_inline bool virt_spin_lock(struct qspinlock *lock)
++{
++	return false;
++}
++#endif
++
++#ifndef __no_arch_spinlock_redefine
++/*
++ * Remapping spinlock architecture specific functions to the corresponding
++ * queued spinlock functions.
++ */
++#define arch_spin_is_locked(l)		queued_spin_is_locked(l)
++#define arch_spin_is_contended(l)	queued_spin_is_contended(l)
++#define arch_spin_value_unlocked(l)	queued_spin_value_unlocked(l)
++#define arch_spin_lock(l)		queued_spin_lock(l)
++#define arch_spin_trylock(l)		queued_spin_trylock(l)
++#define arch_spin_unlock(l)		queued_spin_unlock(l)
++#endif
++
++#endif /* __ASM_GENERRIC_RON_QSPINLOCK_H */
+diff --git a/kernel/locking/ron_proc.c b/kernel/locking/ron_proc.c
+new file mode 100644
+index 000000000000..73db304b04e7
+--- /dev/null
++++ b/kernel/locking/ron_proc.c
+@@ -0,0 +1,46 @@
++#include <linux/proc_fs.h>
++#include <linux/seq_file.h>
++#include <linux/init.h>
++
++#include "ron_route.h"
++
++#define PROC_NAME "ron_core_routing"
++
++
++
++static int ron_route_show(struct seq_file *m, void *v)
++{
++    for (int i = 0; i < ARRAY_SIZE(TSP_ID_ARRAY); i++) {
++        seq_printf(m, "%d%s", TSP_ID_ARRAY[i], (i < ARRAY_SIZE(TSP_ID_ARRAY) - 1) ? ", " : "\n");
++    }
++
++    return 0;
++}
++
++static int ron_route_open(struct inode *inode, struct file *file)
++{
++    return single_open(file, ron_route_show, NULL);
++}
++
++static const struct proc_ops ron_route_proc_ops = 
++{
++    .proc_flags	= PROC_ENTRY_PERMANENT,
++    .proc_open    = ron_route_open,
++    .proc_read_iter  = seq_read_iter,
++    .proc_lseek   = seq_lseek,
++    .proc_release = single_release,
++};
++
++static int __init ron_route_proc_init(void)
++{
++    struct proc_dir_entry *entry;
++
++    entry = proc_create(PROC_NAME, 0, NULL, &ron_route_proc_ops);
++    if (!entry) {
++        pr_err("myvfs: Failed to create /proc/%s\n", PROC_NAME);
++        return -ENOMEM;
++    }
++
++    return 0;
++}
++fs_initcall(ron_route_proc_init);
+\ No newline at end of file
+diff --git a/kernel/locking/ron_qspinlock.c b/kernel/locking/ron_qspinlock.c
+new file mode 100644
+index 000000000000..1221fa9cd353
+--- /dev/null
++++ b/kernel/locking/ron_qspinlock.c
+@@ -0,0 +1,686 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++/*
++ * Queued spinlock
++ *
++ * (C) Copyright 2013-2015 Hewlett-Packard Development Company, L.P.
++ * (C) Copyright 2013-2014,2018 Red Hat, Inc.
++ * (C) Copyright 2015 Intel Corp.
++ * (C) Copyright 2015 Hewlett-Packard Enterprise Development LP
++ *
++ * Authors: Waiman Long <longman@redhat.com>
++ *          Peter Zijlstra <peterz@infradead.org>
++ */
++
++#ifndef _GEN_PV_LOCK_SLOWPATH
++
++#include <linux/smp.h>
++#include <linux/bug.h>
++#include <linux/cpumask.h>
++#include <linux/percpu.h>
++#include <linux/hardirq.h>
++#include <linux/mutex.h>
++#include <linux/prefetch.h>
++#include <asm/byteorder.h>
++#include <asm/ron_qspinlock.h>
++#include <trace/events/lock.h>
++
++
++#include "ron_route.h"
++/*
++ * Include queued spinlock statistics code
++ */
++#include "qspinlock_stat.h"
++
++/*
++ * The basic principle of a queue-based spinlock can best be understood
++ * by studying a classic queue-based spinlock implementation called the
++ * MCS lock. A copy of the original MCS lock paper ("Algorithms for Scalable
++ * Synchronization on Shared-Memory Multiprocessors by Mellor-Crummey and
++ * Scott") is available at
++ *
++ * https://bugzilla.kernel.org/show_bug.cgi?id=206115
++ *
++ * This queued spinlock implementation is based on the MCS lock, however to
++ * make it fit the 4 bytes we assume spinlock_t to be, and preserve its
++ * existing API, we must modify it somehow.
++ *
++ * In particular; where the traditional MCS lock consists of a tail pointer
++ * (8 bytes) and needs the next pointer (another 8 bytes) of its own node to
++ * unlock the next pending (next->locked), we compress both these: {tail,
++ * next->locked} into a single u32 value.
++ *
++ * Since a spinlock disables recursion of its own context and there is a limit
++ * to the contexts that can nest; namely: task, softirq, hardirq, nmi. As there
++ * are at most 4 nesting levels, it can be encoded by a 2-bit number. Now
++ * we can encode the tail by combining the 2-bit nesting level with the cpu
++ * number. With one byte for the lock value and 3 bytes for the tail, only a
++ * 32-bit word is now needed. Even though we only need 1 bit for the lock,
++ * we extend it to a full byte to achieve better performance for architectures
++ * that support atomic byte write.
++ *
++ * We also change the first spinner to spin on the lock bit instead of its
++ * node; whereby avoiding the need to carry a node from lock to unlock, and
++ * preserving existing lock API. This also makes the unlock code simpler and
++ * faster.
++ *
++ * N.B. The current implementation only supports architectures that allow
++ *      atomic operations on smaller 8-bit and 16-bit data types.
++ *
++ */
++
++#include "mcs_spinlock.h"
++#define MAX_NODES	4
++
++/*
++ * On 64-bit architectures, the mcs_spinlock structure will be 16 bytes in
++ * size and four of them will fit nicely in one 64-byte cacheline. For
++ * pvqspinlock, however, we need more space for extra data. To accommodate
++ * that, we insert two more long words to pad it up to 32 bytes. IOW, only
++ * two of them can fit in a cacheline in this case. That is OK as it is rare
++ * to have more than 2 levels of slowpath nesting in actual use. We don't
++ * want to penalize pvqspinlocks to optimize for a rare case in native
++ * qspinlocks.
++ */
++
++struct qnode {
++	struct mcs_spinlock mcs;
++#ifdef CONFIG_PARAVIRT_SPINLOCKS
++	long reserved[2];
++#endif
++};
++
++/*
++ * The pending bit spinning loop count.
++ * This heuristic is used to limit the number of lockword accesses
++ * made by atomic_cond_read_relaxed when waiting for the lock to
++ * transition out of the "== _Q_PENDING_VAL" state. We don't spin
++ * indefinitely because there's no guarantee that we'll make forward
++ * progress.
++ */
++#ifndef _Q_PENDING_LOOPS
++#define _Q_PENDING_LOOPS	1
++#endif
++
++/*
++ * Per-CPU queue node structures; we can never have more than 4 nested
++ * contexts: task, softirq, hardirq, nmi.
++ *
++ * Exactly fits one 64-byte cacheline on a 64-bit architecture.
++ *
++ * PV doubles the storage and uses the second cacheline for PV state.
++ */
++static DEFINE_PER_CPU_ALIGNED(struct qnode, qnodes[MAX_NODES]);
++
++/*
++ * We must be able to distinguish between no-tail and the tail at 0:0,
++ * therefore increment the cpu number by one.
++ */
++
++static inline __pure u32 encode_tail(int cpu, int idx)
++{
++	u32 tail;
++
++	tail  = (cpu + 1) << _Q_TAIL_CPU_OFFSET;
++	tail |= idx << _Q_TAIL_IDX_OFFSET; /* assume < 4 */
++
++	return tail;
++}
++
++static inline __pure struct mcs_spinlock *decode_tail(u32 tail)
++{
++	int cpu = (tail >> _Q_TAIL_CPU_OFFSET) - 1;
++	int idx = (tail &  _Q_TAIL_IDX_MASK) >> _Q_TAIL_IDX_OFFSET;
++
++	return per_cpu_ptr(&qnodes[idx].mcs, cpu);
++}
++
++static inline __pure
++struct mcs_spinlock *grab_mcs_node(struct mcs_spinlock *base, int idx)
++{
++	return &((struct qnode *)base + idx)->mcs;
++}
++
++#define _Q_LOCKED_PENDING_MASK (_Q_LOCKED_MASK | _Q_PENDING_MASK)
++
++#if _Q_PENDING_BITS == 8
++/**
++ * clear_pending - clear the pending bit.
++ * @lock: Pointer to queued spinlock structure
++ *
++ * *,1,* -> *,0,*
++ */
++static __always_inline void clear_pending(struct qspinlock *lock)
++{
++	WRITE_ONCE(lock->pending, 0);
++}
++
++/**
++ * clear_pending_set_locked - take ownership and clear the pending bit.
++ * @lock: Pointer to queued spinlock structure
++ *
++ * *,1,0 -> *,0,1
++ *
++ * Lock stealing is not allowed if this function is used.
++ */
++static __always_inline void clear_pending_set_locked(struct qspinlock *lock)
++{
++	WRITE_ONCE(lock->locked_pending, _Q_LOCKED_VAL);
++}
++
++/*
++ * xchg_tail - Put in the new queue tail code word & retrieve previous one
++ * @lock : Pointer to queued spinlock structure
++ * @tail : The new queue tail code word
++ * Return: The previous queue tail code word
++ *
++ * xchg(lock, tail), which heads an address dependency
++ *
++ * p,*,* -> n,*,* ; prev = xchg(lock, node)
++ */
++static __always_inline u32 xchg_tail(struct qspinlock *lock, u32 tail)
++{
++	/*
++	 * We can use relaxed semantics since the caller ensures that the
++	 * MCS node is properly initialized before updating the tail.
++	 */
++	return (u32)xchg_relaxed(&lock->tail,
++				 tail >> _Q_TAIL_OFFSET) << _Q_TAIL_OFFSET;
++}
++
++#else /* _Q_PENDING_BITS == 8 */
++
++/**
++ * clear_pending - clear the pending bit.
++ * @lock: Pointer to queued spinlock structure
++ *
++ * *,1,* -> *,0,*
++ */
++static __always_inline void clear_pending(struct qspinlock *lock)
++{
++	atomic_andnot(_Q_PENDING_VAL, &lock->val);
++}
++
++/**
++ * clear_pending_set_locked - take ownership and clear the pending bit.
++ * @lock: Pointer to queued spinlock structure
++ *
++ * *,1,0 -> *,0,1
++ */
++static __always_inline void clear_pending_set_locked(struct qspinlock *lock)
++{
++	atomic_add(-_Q_PENDING_VAL + _Q_LOCKED_VAL, &lock->val);
++}
++
++/**
++ * xchg_tail - Put in the new queue tail code word & retrieve previous one
++ * @lock : Pointer to queued spinlock structure
++ * @tail : The new queue tail code word
++ * Return: The previous queue tail code word
++ *
++ * xchg(lock, tail)
++ *
++ * p,*,* -> n,*,* ; prev = xchg(lock, node)
++ */
++static __always_inline u32 xchg_tail(struct qspinlock *lock, u32 tail)
++{
++	u32 old, new;
++
++	old = atomic_read(&lock->val);
++	do {
++		new = (old & _Q_LOCKED_PENDING_MASK) | tail;
++		/*
++		 * We can use relaxed semantics since the caller ensures that
++		 * the MCS node is properly initialized before updating the
++		 * tail.
++		 */
++	} while (!atomic_try_cmpxchg_relaxed(&lock->val, &old, new));
++
++	return old;
++}
++#endif /* _Q_PENDING_BITS == 8 */
++
++/**
++ * queued_fetch_set_pending_acquire - fetch the whole lock value and set pending
++ * @lock : Pointer to queued spinlock structure
++ * Return: The previous lock value
++ *
++ * *,*,* -> *,1,*
++ */
++#ifndef queued_fetch_set_pending_acquire
++static __always_inline u32 queued_fetch_set_pending_acquire(struct qspinlock *lock)
++{
++	return atomic_fetch_or_acquire(_Q_PENDING_VAL, &lock->val);
++}
++#endif
++
++/**
++ * set_locked - Set the lock bit and own the lock
++ * @lock: Pointer to queued spinlock structure
++ *
++ * *,*,0 -> *,0,1
++ */
++static __always_inline void set_locked(struct qspinlock *lock)
++{
++	WRITE_ONCE(lock->locked, _Q_LOCKED_VAL);
++}
++
++
++/*
++ * Generate the native code for queued_spin_unlock_slowpath(); provide NOPs for
++ * all the PV callbacks.
++ */
++
++static __always_inline void __pv_init_node(struct mcs_spinlock *node) { }
++static __always_inline void __pv_wait_node(struct mcs_spinlock *node,
++					   struct mcs_spinlock *prev) { }
++static __always_inline void __pv_kick_node(struct qspinlock *lock,
++					   struct mcs_spinlock *node) { }
++static __always_inline u32  __pv_wait_head_or_lock(struct qspinlock *lock,
++						   struct mcs_spinlock *node)
++						   { return 0; }
++
++#define pv_enabled()		false
++
++#define pv_init_node		__pv_init_node
++#define pv_wait_node		__pv_wait_node
++#define pv_kick_node		__pv_kick_node
++#define pv_wait_head_or_lock	__pv_wait_head_or_lock
++
++#ifdef CONFIG_PARAVIRT_SPINLOCKS
++#define queued_spin_lock_slowpath	native_queued_spin_lock_slowpath
++#endif
++
++#endif /* _GEN_PV_LOCK_SLOWPATH */
++
++struct Plock {
++	atomic_t numWait;
++	atomic_t contextField[4];
++} __attribute__((aligned(8)));
++
++struct SpinlockAddress {
++	struct qspinlock *addr;
++};
++
++struct Plock wait_ary[NR_CPUS] __attribute__((aligned(L1_CACHE_BYTES))) = { 0 };
++
++struct SpinlockAddress spinlockAddr[NR_CPUS][4]
++	__attribute__((aligned(L1_CACHE_BYTES))) = { NULL };
++
++
++
++static __always_inline int getTspOrder(void)
++{
++	return TSP_ID_ARRAY[smp_processor_id()];
++}
++
++void ron_spin_lock(struct qspinlock *lock)
++{
++	int tspOrder = getTspOrder();
++	//int zero = 0;
++	int zero32;
++	int zero;
++
++	int context = atomic_fetch_add_relaxed(
++		1, &wait_ary[tspOrder].numWait);
++
++	if (unlikely(context >= 4)) {
++		while (1) {
++			while (atomic_read(&lock->val) != 0)
++				cpu_relax();
++
++			zero32 = 0;
++			if (atomic_try_cmpxchg_relaxed(
++				    &lock->val, &zero32, 1)) {
++				//spinlockAddr[tspOrder][context].addr = NULL;
++				//wait_ary[tspOrder].numWait.counter = 1;
++				return;
++				//goto release;
++			}
++		}
++	}
++	spinlockAddr[tspOrder][context].addr = lock;
++
++	while (1) {
++		while (atomic_read(&wait_ary[tspOrder].contextField[context]) == 0 &&
++		       atomic_read(&lock->val) == 1)
++			asm("pause");
++
++		zero = 1;
++		if (atomic_try_cmpxchg_relaxed(
++			    &wait_ary[tspOrder].contextField[context], &zero, 0)) {
++			return;
++		}
++
++		zero32 = 0;
++		if (atomic_try_cmpxchg_relaxed(
++			    &lock->val, &zero32, 1)) {
++			spinlockAddr[tspOrder][context].addr = NULL;
++			return;
++		}
++	}
++}
++
++void ron_spin_unlock(struct qspinlock *lock)
++{
++	int i;
++	int tspOrder = getTspOrder();
++	atomic_fetch_sub_release(1, &wait_ary[tspOrder].numWait);
++
++	for (i = 0; i < NR_CPUS; i++) {
++		int idx = (tspOrder + i) % NR_CPUS;
++		if (atomic_read(&wait_ary[idx].numWait) > 0) {
++			int j;
++			for (j = 3; j >= 0; j--) {
++				if (spinlockAddr[idx][j].addr == lock) {
++					atomic_set(&wait_ary[idx].contextField[j], 1);
++					return;
++				}
++			}
++		}
++	}
++	// atomic_set_relaxed()
++	atomic_set_release(&lock->val, 0);
++}
++
++/**
++ * queued_spin_lock_slowpath - acquire the queued spinlock
++ * @lock: Pointer to queued spinlock structure
++ * @val: Current value of the queued spinlock 32-bit word
++ *
++ * (queue tail, pending bit, lock value)
++ *
++ *              fast     :    slow                                  :    unlock
++ *                       :                                          :
++ * uncontended  (0,0,0) -:--> (0,0,1) ------------------------------:--> (*,*,0)
++ *                       :       | ^--------.------.             /  :
++ *                       :       v           \      \            |  :
++ * pending               :    (0,1,1) +--> (0,1,0)   \           |  :
++ *                       :       | ^--'              |           |  :
++ *                       :       v                   |           |  :
++ * uncontended           :    (n,x,y) +--> (n,0,0) --'           |  :
++ *   queue               :       | ^--'                          |  :
++ *                       :       v                               |  :
++ * contended             :    (*,x,y) +--> (*,0,0) ---> (*,0,1) -'  :
++ *   queue               :         ^--'                             :
++ */
++void __lockfunc queued_spin_lock_slowpath(struct qspinlock *lock, u32 val)
++{
++	struct mcs_spinlock *prev, *next, *node;
++	u32 old, tail;
++	int idx;
++
++	BUILD_BUG_ON(CONFIG_NR_CPUS >= (1U << _Q_TAIL_CPU_BITS));
++
++	if (pv_enabled())
++		goto pv_queue;
++
++	if (virt_spin_lock(lock))
++		return;
++
++	/*
++	 * Wait for in-progress pending->locked hand-overs with a bounded
++	 * number of spins so that we guarantee forward progress.
++	 *
++	 * 0,1,0 -> 0,0,1
++	 */
++	if (val == _Q_PENDING_VAL) {
++		int cnt = _Q_PENDING_LOOPS;
++		val = atomic_cond_read_relaxed(&lock->val,
++					       (VAL != _Q_PENDING_VAL) || !cnt--);
++	}
++
++	/*
++	 * If we observe any contention; queue.
++	 */
++	if (val & ~_Q_LOCKED_MASK)
++		goto queue;
++
++	/*
++	 * trylock || pending
++	 *
++	 * 0,0,* -> 0,1,* -> 0,0,1 pending, trylock
++	 */
++	val = queued_fetch_set_pending_acquire(lock);
++
++	/*
++	 * If we observe contention, there is a concurrent locker.
++	 *
++	 * Undo and queue; our setting of PENDING might have made the
++	 * n,0,0 -> 0,0,0 transition fail and it will now be waiting
++	 * on @next to become !NULL.
++	 */
++	if (unlikely(val & ~_Q_LOCKED_MASK)) {
++
++		/* Undo PENDING if we set it. */
++		if (!(val & _Q_PENDING_MASK))
++			clear_pending(lock);
++
++		goto queue;
++	}
++
++	/*
++	 * We're pending, wait for the owner to go away.
++	 *
++	 * 0,1,1 -> *,1,0
++	 *
++	 * this wait loop must be a load-acquire such that we match the
++	 * store-release that clears the locked bit and create lock
++	 * sequentiality; this is because not all
++	 * clear_pending_set_locked() implementations imply full
++	 * barriers.
++	 */
++	if (val & _Q_LOCKED_MASK)
++		smp_cond_load_acquire(&lock->locked, !VAL);
++
++	/*
++	 * take ownership and clear the pending bit.
++	 *
++	 * 0,1,0 -> 0,0,1
++	 */
++	clear_pending_set_locked(lock);
++	lockevent_inc(lock_pending);
++	return;
++
++	/*
++	 * End of pending bit optimistic spinning and beginning of MCS
++	 * queuing.
++	 */
++queue:
++	lockevent_inc(lock_slowpath);
++pv_queue:
++	node = this_cpu_ptr(&qnodes[0].mcs);
++	idx = node->count++;
++	tail = encode_tail(smp_processor_id(), idx);
++
++	trace_contention_begin(lock, LCB_F_SPIN);
++
++	/*
++	 * 4 nodes are allocated based on the assumption that there will
++	 * not be nested NMIs taking spinlocks. That may not be true in
++	 * some architectures even though the chance of needing more than
++	 * 4 nodes will still be extremely unlikely. When that happens,
++	 * we fall back to spinning on the lock directly without using
++	 * any MCS node. This is not the most elegant solution, but is
++	 * simple enough.
++	 */
++	if (unlikely(idx >= MAX_NODES)) {
++		lockevent_inc(lock_no_node);
++		while (!queued_spin_trylock(lock))
++			cpu_relax();
++		goto release;
++	}
++
++	node = grab_mcs_node(node, idx);
++
++	/*
++	 * Keep counts of non-zero index values:
++	 */
++	lockevent_cond_inc(lock_use_node2 + idx - 1, idx);
++
++	/*
++	 * Ensure that we increment the head node->count before initialising
++	 * the actual node. If the compiler is kind enough to reorder these
++	 * stores, then an IRQ could overwrite our assignments.
++	 */
++	barrier();
++
++	node->locked = 0;
++	node->next = NULL;
++	pv_init_node(node);
++
++	/*
++	 * We touched a (possibly) cold cacheline in the per-cpu queue node;
++	 * attempt the trylock once more in the hope someone let go while we
++	 * weren't watching.
++	 */
++	if (queued_spin_trylock(lock))
++		goto release;
++
++	/*
++	 * Ensure that the initialisation of @node is complete before we
++	 * publish the updated tail via xchg_tail() and potentially link
++	 * @node into the waitqueue via WRITE_ONCE(prev->next, node) below.
++	 */
++	smp_wmb();
++
++	/*
++	 * Publish the updated tail.
++	 * We have already touched the queueing cacheline; don't bother with
++	 * pending stuff.
++	 *
++	 * p,*,* -> n,*,*
++	 */
++	old = xchg_tail(lock, tail);
++	next = NULL;
++
++	/*
++	 * if there was a previous node; link it and wait until reaching the
++	 * head of the waitqueue.
++	 */
++	if (old & _Q_TAIL_MASK) {
++		prev = decode_tail(old);
++
++		/* Link @node into the waitqueue. */
++		WRITE_ONCE(prev->next, node);
++
++		pv_wait_node(node, prev);
++		arch_mcs_spin_lock_contended(&node->locked);
++
++		/*
++		 * While waiting for the MCS lock, the next pointer may have
++		 * been set by another lock waiter. We optimistically load
++		 * the next pointer & prefetch the cacheline for writing
++		 * to reduce latency in the upcoming MCS unlock operation.
++		 */
++		next = READ_ONCE(node->next);
++		if (next)
++			prefetchw(next);
++	}
++
++	/*
++	 * we're at the head of the waitqueue, wait for the owner & pending to
++	 * go away.
++	 *
++	 * *,x,y -> *,0,0
++	 *
++	 * this wait loop must use a load-acquire such that we match the
++	 * store-release that clears the locked bit and create lock
++	 * sequentiality; this is because the set_locked() function below
++	 * does not imply a full barrier.
++	 *
++	 * The PV pv_wait_head_or_lock function, if active, will acquire
++	 * the lock and return a non-zero value. So we have to skip the
++	 * atomic_cond_read_acquire() call. As the next PV queue head hasn't
++	 * been designated yet, there is no way for the locked value to become
++	 * _Q_SLOW_VAL. So both the set_locked() and the
++	 * atomic_cmpxchg_relaxed() calls will be safe.
++	 *
++	 * If PV isn't active, 0 will be returned instead.
++	 *
++	 */
++	if ((val = pv_wait_head_or_lock(lock, node)))
++		goto locked;
++
++	val = atomic_cond_read_acquire(&lock->val, !(VAL & _Q_LOCKED_PENDING_MASK));
++
++locked:
++	/*
++	 * claim the lock:
++	 *
++	 * n,0,0 -> 0,0,1 : lock, uncontended
++	 * *,*,0 -> *,*,1 : lock, contended
++	 *
++	 * If the queue head is the only one in the queue (lock value == tail)
++	 * and nobody is pending, clear the tail code and grab the lock.
++	 * Otherwise, we only need to grab the lock.
++	 */
++
++	/*
++	 * In the PV case we might already have _Q_LOCKED_VAL set, because
++	 * of lock stealing; therefore we must also allow:
++	 *
++	 * n,0,1 -> 0,0,1
++	 *
++	 * Note: at this point: (val & _Q_PENDING_MASK) == 0, because of the
++	 *       above wait condition, therefore any concurrent setting of
++	 *       PENDING will make the uncontended transition fail.
++	 */
++	if ((val & _Q_TAIL_MASK) == tail) {
++		if (atomic_try_cmpxchg_relaxed(&lock->val, &val, _Q_LOCKED_VAL))
++			goto release; /* No contention */
++	}
++
++	/*
++	 * Either somebody is queued behind us or _Q_PENDING_VAL got set
++	 * which will then detect the remaining tail and queue behind us
++	 * ensuring we'll see a @next.
++	 */
++	set_locked(lock);
++
++	/*
++	 * contended path; wait for next if not observed yet, release.
++	 */
++	if (!next)
++		next = smp_cond_load_relaxed(&node->next, (VAL));
++
++	arch_mcs_spin_unlock_contended(&next->locked);
++	pv_kick_node(lock, next);
++
++release:
++	trace_contention_end(lock, 0);
++
++	/*
++	 * release the node
++	 */
++	__this_cpu_dec(qnodes[0].mcs.count);
++}
++EXPORT_SYMBOL(queued_spin_lock_slowpath);
++
++/*
++ * Generate the paravirt code for queued_spin_unlock_slowpath().
++ */
++#if !defined(_GEN_PV_LOCK_SLOWPATH) && defined(CONFIG_PARAVIRT_SPINLOCKS)
++#define _GEN_PV_LOCK_SLOWPATH
++
++#undef  pv_enabled
++#define pv_enabled()	true
++
++#undef pv_init_node
++#undef pv_wait_node
++#undef pv_kick_node
++#undef pv_wait_head_or_lock
++
++#undef  queued_spin_lock_slowpath
++#define queued_spin_lock_slowpath	__pv_queued_spin_lock_slowpath
++
++#include "qspinlock_paravirt.h"
++#include "ron_qspinlock.c"
++
++bool nopvspin;
++static __init int parse_nopvspin(char *arg)
++{
++	nopvspin = true;
++	return 0;
++}
++early_param("nopvspin", parse_nopvspin);
++#endif
+diff --git a/kernel/locking/ron_qspinlock_.c b/kernel/locking/ron_qspinlock_.c
+new file mode 100644
+index 000000000000..e597540401dc
+--- /dev/null
++++ b/kernel/locking/ron_qspinlock_.c
+@@ -0,0 +1,193 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++/*
++ * Queued spinlock
++ *
++ * (C) Copyright 2013-2015 Hewlett-Packard Development Company, L.P.
++ * (C) Copyright 2013-2014,2018 Red Hat, Inc.
++ * (C) Copyright 2015 Intel Corp.
++ * (C) Copyright 2015 Hewlett-Packard Enterprise Development LP
++ *
++ * Authors: Waiman Long <longman@redhat.com>
++ *          Peter Zijlstra <peterz@infradead.org>
++ */
++
++#include <linux/smp.h>
++#include <linux/bug.h>
++#include <linux/cpumask.h>
++#include <linux/percpu.h>
++#include <linux/hardirq.h>
++#include <linux/mutex.h>
++#include <linux/prefetch.h>
++#include <asm/byteorder.h>
++#include <asm/ron_qspinlock.h>
++#include <trace/events/lock.h>
++//#include <stdatomic.h>
++
++#include "ron_route.h"
++
++/*
++ * Include queued spinlock statistics code
++ */
++#include "qspinlock_stat.h"
++
++/*
++ * The basic principle of a queue-based spinlock can best be understood
++ * by studying a classic queue-based spinlock implementation called the
++ * MCS lock. A copy of the original MCS lock paper ("Algorithms for Scalable
++ * Synchronization on Shared-Memory Multiprocessors by Mellor-Crummey and
++ * Scott") is available at
++ *
++ * https://bugzilla.kernel.org/show_bug.cgi?id=206115
++ *
++ * This queued spinlock implementation is based on the MCS lock, however to
++ * make it fit the 4 bytes we assume spinlock_t to be, and preserve its
++ * existing API, we must modify it somehow.
++ *
++ * In particular; where the traditional MCS lock consists of a tail pointer
++ * (8 bytes) and needs the next pointer (another 8 bytes) of its own node to
++ * unlock the next pending (next->locked), we compress both these: {tail,
++ * next->locked} into a single u32 value.
++ *
++ * Since a spinlock disables recursion of its own context and there is a limit
++ * to the contexts that can nest; namely: task, softirq, hardirq, nmi. As there
++ * are at most 4 nesting levels, it can be encoded by a 2-bit number. Now
++ * we can encode the tail by combining the 2-bit nesting level with the cpu
++ * number. With one byte for the lock value and 3 bytes for the tail, only a
++ * 32-bit word is now needed. Even though we only need 1 bit for the lock,
++ * we extend it to a full byte to achieve better performance for architectures
++ * that support atomic byte write.
++ *
++ * We also change the first spinner to spin on the lock bit instead of its
++ * node; whereby avoiding the need to carry a node from lock to unlock, and
++ * preserving existing lock API. This also makes the unlock code simpler and
++ * faster.
++ *
++ * N.B. The current implementation only supports architectures that allow
++ *      atomic operations on smaller 8-bit and 16-bit data types.
++ *
++ */
++
++#include "mcs_spinlock.h"
++#define MAX_NODES 4
++
++/*
++ * On 64-bit architectures, the mcs_spinlock structure will be 16 bytes in
++ * size and four of them will fit nicely in one 64-byte cacheline. For
++ * pvqspinlock, however, we need more space for extra data. To accommodate
++ * that, we insert two more long words to pad it up to 32 bytes. IOW, only
++ * two of them can fit in a cacheline in this case. That is OK as it is rare
++ * to have more than 2 levels of slowpath nesting in actual use. We don't
++ * want to penalize pvqspinlocks to optimize for a rare case in native
++ * qspinlocks.
++ */
++struct Plock {
++	atomic_t numWait;
++	atomic_t contextField[4];
++} __attribute__((aligned(8)));
++
++struct SpinlockAddress {
++	struct qspinlock *addr;
++};
++
++struct Plock wait_ary[NR_CPUS] __attribute__((aligned(L1_CACHE_BYTES))) = { 0 };
++
++struct SpinlockAddress spinlockAddr[NR_CPUS][4]
++	__attribute__((aligned(L1_CACHE_BYTES))) = { NULL };
++
++
++
++static __always_inline int getTspOrder(void)
++{
++	return TSP_ID_ARRAY[smp_processor_id()];
++}
++
++void ron_spin_lock(struct qspinlock *lock)
++{
++	int tspOrder = getTspOrder();
++	//int zero = 0;
++	int zero32;
++	int zero;
++
++	int context = atomic_fetch_add_relaxed(
++		1, &wait_ary[tspOrder].numWait);
++
++	if (unlikely(context >= 4)) {
++		while (1) {
++			while (atomic_read(&lock->val) != 0)
++				cpu_relax();
++
++			zero32 = 0;
++			if (atomic_try_cmpxchg_relaxed(
++				    &lock->val, &zero32, 1)) {
++				//spinlockAddr[tspOrder][context].addr = NULL;
++				//wait_ary[tspOrder].numWait.counter = 1;
++				return;
++				//goto release;
++			}
++		}
++	}
++	spinlockAddr[tspOrder][context].addr = lock;
++
++	while (1) {
++		while (atomic_read(&wait_ary[tspOrder].contextField[context]) == 0 &&
++		       atomic_read(&lock->val) == 1)
++			asm("pause");
++
++		zero = 1;
++		if (atomic_try_cmpxchg_relaxed(
++			    &wait_ary[tspOrder].contextField[context], &zero, 0)) {
++			return;
++		}
++
++		zero32 = 0;
++		if (atomic_try_cmpxchg_relaxed(
++			    &lock->val, &zero32, 1)) {
++			spinlockAddr[tspOrder][context].addr = NULL;
++			return;
++		}
++	}
++}
++
++void ron_spin_unlock(struct qspinlock *lock)
++{
++	int i;
++	int tspOrder = getTspOrder();
++	atomic_fetch_sub_release(1, &wait_ary[tspOrder].numWait);
++
++	for (i = 0; i < NR_CPUS; i++) {
++		int idx = (tspOrder + i) % NR_CPUS;
++		if (atomic_read(&wait_ary[idx].numWait) > 0) {
++			int j;
++			for (j = 3; j >= 0; j--) {
++				if (spinlockAddr[idx][j].addr == lock) {
++					atomic_set(&wait_ary[idx].contextField[j], 1);
++					return;
++				}
++			}
++		}
++	}
++	// atomic_set_relaxed()
++	atomic_set_release(&lock->val, 0);
++}
++
++/*
++ * Per-CPU queue node structures; we can never have more than 4 nested
++ * contexts: task, softirq, hardirq, nmi.
++ *
++ * Exactly fits one 64-byte cacheline on a 64-bit architecture.
++ *
++ * PV doubles the storage and uses the second cacheline for PV state.
++ */
++
++/*
++static DEFINE_PER_CPU_ALIGNED(struct qnode, qnodes[MAX_NODES]);
++
++void __lockfunc queued_spin_lock_slowpath(struct qspinlock *lock, u32 val)
++{
++	BUILD_BUG_ON(CONFIG_NR_CPUS >= (1U << _Q_TAIL_CPU_BITS));
++
++	_spin_lock(lock)
++
++	_spin_unlock(lock)
++}
++*/
+\ No newline at end of file
+diff --git a/kernel/locking/ron_route.c b/kernel/locking/ron_route.c
+new file mode 100644
+index 000000000000..a047443f7a55
+--- /dev/null
++++ b/kernel/locking/ron_route.c
+@@ -0,0 +1,14 @@
++#include <linux/proc_fs.h>
++#include <linux/seq_file.h>
++#include <linux/init.h>
++
++#include "ron_route.h"
++
++#define PROC_NAME "ron_core_routing"
++
++
++int TSP_ID_ARRAY[CORE_COUNT] = {0,  1,  2,  3,  32, 33, 34, 35, 4,  5,  6,  7,  36,
++                          37, 38, 39, 8,  9,  10, 11, 40, 41, 42, 43, 12, 13,
++                          14, 15, 44, 45, 46, 47, 24, 25, 26, 27, 56, 57, 58,
++                          59, 28, 29, 30, 31, 60, 61, 62, 63, 16, 17, 18, 19,
++                          48, 49, 50, 51, 20, 21, 22, 23, 52, 53, 54, 55};
+diff --git a/kernel/locking/ron_route.h b/kernel/locking/ron_route.h
+new file mode 100644
+index 000000000000..1ec906b7e6b8
+--- /dev/null
++++ b/kernel/locking/ron_route.h
+@@ -0,0 +1,10 @@
++#ifndef _RON_ROUTE_H
++#define _RON_ROUTE_H
++
++#define CORE_COUNT 64
++
++extern int TSP_ID_ARRAY[CORE_COUNT];
++
++//int *get_tsp_id_array(void);
++
++#endif
+\ No newline at end of file
+-- 
+2.43.0
+
+
+From 9f7bcc8106fa6d5b8b25c6e0c89f737ceb7bb959 Mon Sep 17 00:00:00 2001
+From: da267388 <hagud65171@gmail.com>
+Date: Mon, 26 May 2025 17:04:31 +0800
+Subject: [PATCH 2/3] makefile, kconfig, and files include qspinlock.h
+
+---
+ arch/x86/include/asm/ron_qspinlock.h | 39 ++++++++++---------
+ arch/x86/include/asm/spinlock.h      |  6 ++-
+ arch/x86/kernel/kvm.c                |  6 ++-
+ arch/x86/kernel/smpboot.c            |  8 +++-
+ arch/x86/xen/spinlock.c              |  7 +++-
+ include/asm-generic/ron_qspinlock.h  | 12 ++----
+ kernel/Kconfig.locks                 | 14 ++++++-
+ kernel/locking/Makefile              |  3 ++
+ kernel/locking/ron_qspinlock.c       | 58 +++++++++++++++++++++-------
+ 9 files changed, 104 insertions(+), 49 deletions(-)
+
+diff --git a/arch/x86/include/asm/ron_qspinlock.h b/arch/x86/include/asm/ron_qspinlock.h
+index da5c7246bf62..25267e06fa30 100644
+--- a/arch/x86/include/asm/ron_qspinlock.h
++++ b/arch/x86/include/asm/ron_qspinlock.h
+@@ -84,30 +84,31 @@ DECLARE_STATIC_KEY_FALSE(virt_spin_lock_key);
+  *   true - lock has been negotiated, all done;
+  *   false - queued_spin_lock_slowpath() will do its thing.
+  */
+-#define virt_spin_lock virt_spin_lock
+-static inline bool virt_spin_lock(struct qspinlock *lock)
+-{
+-	int val;
+ 
+-	if (!static_branch_likely(&virt_spin_lock_key))
+-		return false;
++// #define virt_spin_lock virt_spin_lock
++// static inline bool virt_spin_lock(struct qspinlock *lock)
++// {
++// 	int val;
+ 
+-	/*
+-	 * On hypervisors without PARAVIRT_SPINLOCKS support we fall
+-	 * back to a Test-and-Set spinlock, because fair locks have
+-	 * horrible lock 'holder' preemption issues.
+-	 */
++// 	if (!static_branch_likely(&virt_spin_lock_key))
++// 		return false;
+ 
+- __retry:
+-	val = atomic_read(&lock->val);
++// 	/*
++// 	 * On hypervisors without PARAVIRT_SPINLOCKS support we fall
++// 	 * back to a Test-and-Set spinlock, because fair locks have
++// 	 * horrible lock 'holder' preemption issues.
++// 	 */
+ 
+-	if (val || !atomic_try_cmpxchg(&lock->val, &val, _Q_LOCKED_VAL)) {
+-		cpu_relax();
+-		goto __retry;
+-	}
++//  __retry:
++// 	val = atomic_read(&lock->val);
+ 
+-	return true;
+-}
++// 	if (val || !atomic_try_cmpxchg(&lock->val, &val, _Q_LOCKED_VAL)) {
++// 		cpu_relax();
++// 		goto __retry;
++// 	}
++
++// 	return true;
++// }
+ 
+ #endif /* CONFIG_PARAVIRT */
+ 
+diff --git a/arch/x86/include/asm/spinlock.h b/arch/x86/include/asm/spinlock.h
+index 5b6bc7016c22..899c968bd456 100644
+--- a/arch/x86/include/asm/spinlock.h
++++ b/arch/x86/include/asm/spinlock.h
+@@ -24,7 +24,11 @@
+ /* How long a lock should spin before we consider blocking */
+ #define SPIN_THRESHOLD	(1 << 15)
+ 
+-#include <asm/qspinlock.h>
++#ifndef CONFIG_RON_QUEUED_SPINLOCKS
++# include <asm/qspinlock.h>
++#else
++# include <asm/ron_qspinlock.h>
++#endif
+ 
+ /*
+  * Read-write spinlocks, allowing multiple readers
+diff --git a/arch/x86/kernel/kvm.c b/arch/x86/kernel/kvm.c
+index 7a422a6c5983..5b264aba6d77 100644
+--- a/arch/x86/kernel/kvm.c
++++ b/arch/x86/kernel/kvm.c
+@@ -1041,7 +1041,11 @@ static void kvm_kick_cpu(int cpu)
+ 	kvm_hypercall2(KVM_HC_KICK_CPU, flags, apicid);
+ }
+ 
+-#include <asm/qspinlock.h>
++#ifndef CONFIG_RON_QUEUED_SPINLOCKS
++# include <asm/qspinlock.h>
++#else
++# include <asm/ron_qspinlock.h>
++#endif
+ 
+ static void kvm_wait(u8 *ptr, u8 val)
+ {
+diff --git a/arch/x86/kernel/smpboot.c b/arch/x86/kernel/smpboot.c
+index c10850ae6f09..bbb01f5fdf16 100644
+--- a/arch/x86/kernel/smpboot.c
++++ b/arch/x86/kernel/smpboot.c
+@@ -82,7 +82,13 @@
+ #include <asm/microcode.h>
+ #include <asm/i8259.h>
+ #include <asm/misc.h>
+-#include <asm/qspinlock.h>
++
++#ifndef CONFIG_RON_QUEUED_SPINLOCKS
++# include <asm/qspinlock.h>
++#else
++# include <asm/ron_qspinlock.h>
++#endif
++
+ #include <asm/intel-family.h>
+ #include <asm/cpu_device_id.h>
+ #include <asm/spec-ctrl.h>
+diff --git a/arch/x86/xen/spinlock.c b/arch/x86/xen/spinlock.c
+index 8e4efe0fb6f9..cd37362dd738 100644
+--- a/arch/x86/xen/spinlock.c
++++ b/arch/x86/xen/spinlock.c
+@@ -9,7 +9,12 @@
+ #include <linux/atomic.h>
+ 
+ #include <asm/paravirt.h>
+-#include <asm/qspinlock.h>
++
++#ifndef CONFIG_RON_QUEUED_SPINLOCKS
++# include <asm/qspinlock.h>
++#else
++# include <asm/ron_qspinlock.h>
++#endif
+ 
+ #include <xen/events.h>
+ 
+diff --git a/include/asm-generic/ron_qspinlock.h b/include/asm-generic/ron_qspinlock.h
+index 508f28ccdb31..41cf090be0c0 100644
+--- a/include/asm-generic/ron_qspinlock.h
++++ b/include/asm-generic/ron_qspinlock.h
+@@ -52,12 +52,8 @@ static __always_inline int queued_spin_is_contended(struct qspinlock *lock)
+  */
+ static __always_inline int queued_spin_trylock(struct qspinlock *lock)
+ {
+-	int val = atomic_read(&lock->val);
+ 
+-	if (unlikely(val))
+-		return 0;
+-
+-	return likely(atomic_try_cmpxchg_acquire(&lock->val, &val, _Q_LOCKED_VAL));
++	return false;
+ }
+ 
+ extern void queued_spin_lock_slowpath(struct qspinlock *lock, u32 val);
+@@ -71,10 +67,8 @@ extern void ron_spin_unlock(struct qspinlock *lock);
+  */
+ static __always_inline void queued_spin_lock(struct qspinlock *lock)
+ {
+-	int val = 0;
+-
+-	if (likely(atomic_try_cmpxchg_acquire(&lock->val, &val, _Q_LOCKED_VAL)))
+-		return;
++	
++	//pr_info("queued_spin_lock\n");
+ 
+ 	ron_spin_lock(lock);
+ }
+diff --git a/kernel/Kconfig.locks b/kernel/Kconfig.locks
+index 4198f0273ecd..610bd6aff52e 100644
+--- a/kernel/Kconfig.locks
++++ b/kernel/Kconfig.locks
+@@ -239,9 +239,19 @@ config LOCK_SPIN_ON_OWNER
+ config ARCH_USE_QUEUED_SPINLOCKS
+ 	bool
+ 
++
++choice
++    prompt "Spinlock Implementation"
++    default QUEUED_SPINLOCKS
++
+ config QUEUED_SPINLOCKS
+-	def_bool y if ARCH_USE_QUEUED_SPINLOCKS
+-	depends on SMP
++    bool "Default queued spinlock"
++    depends on SMP
++
++config RON_QUEUED_SPINLOCKS
++    bool "Custom Ron-style spinlock"
++    depends on SMP
++endchoice
+ 
+ config BPF_ARCH_SPINLOCK
+ 	bool
+diff --git a/kernel/locking/Makefile b/kernel/locking/Makefile
+index 0db4093d17b8..50feaaaa37bf 100644
+--- a/kernel/locking/Makefile
++++ b/kernel/locking/Makefile
+@@ -24,6 +24,9 @@ obj-$(CONFIG_SMP) += spinlock.o
+ obj-$(CONFIG_LOCK_SPIN_ON_OWNER) += osq_lock.o
+ obj-$(CONFIG_PROVE_LOCKING) += spinlock.o
+ obj-$(CONFIG_QUEUED_SPINLOCKS) += qspinlock.o
++obj-$(CONFIG_RON_QUEUED_SPINLOCKS) += ron_route.o
++obj-$(CONFIG_RON_QUEUED_SPINLOCKS) += ron_qspinlock.o
++obj-$(CONFIG_RON_QUEUED_SPINLOCKS) += ron_proc.o
+ obj-$(CONFIG_RT_MUTEXES) += rtmutex_api.o
+ obj-$(CONFIG_PREEMPT_RT) += spinlock_rt.o ww_rt_mutex.o
+ obj-$(CONFIG_DEBUG_SPINLOCK) += spinlock.o
+diff --git a/kernel/locking/ron_qspinlock.c b/kernel/locking/ron_qspinlock.c
+index 1221fa9cd353..633df1156a00 100644
+--- a/kernel/locking/ron_qspinlock.c
++++ b/kernel/locking/ron_qspinlock.c
+@@ -301,9 +301,9 @@ struct SpinlockAddress {
+ 	struct qspinlock *addr;
+ };
+ 
+-struct Plock wait_ary[NR_CPUS] __attribute__((aligned(L1_CACHE_BYTES))) = { 0 };
++struct Plock wait_ary[CORE_COUNT] __attribute__((aligned(L1_CACHE_BYTES))) = { 0 };
+ 
+-struct SpinlockAddress spinlockAddr[NR_CPUS][4]
++struct SpinlockAddress spinlockAddr[CORE_COUNT][4]
+ 	__attribute__((aligned(L1_CACHE_BYTES))) = { NULL };
+ 
+ 
+@@ -313,23 +313,44 @@ static __always_inline int getTspOrder(void)
+ 	return TSP_ID_ARRAY[smp_processor_id()];
+ }
+ 
++/*
++static int __init init_ron_spinlock(void)
++{
++	pr_info("ron_spinlock: wait_ary and spinlockAddr initialize start\n");
++	int cpu, i;
++	for (cpu = 0; cpu < NR_CPUS; cpu++) {
++		atomic_set(&wait_ary[cpu].numWait, 0);
++		for (i = 0; i < 4; i++) {
++			atomic_set(&wait_ary[cpu].contextField[i], 0);
++			WRITE_ONCE(spinlockAddr[cpu][i].addr, NULL);
++		}
++	}
++	pr_info("ron_spinlock: wait_ary and spinlockAddr initialized\n");
++	return 0;
++}
++early_initcall(init_ron_spinlock);*/
++
++int flag = 0;
++
+ void ron_spin_lock(struct qspinlock *lock)
+ {
+ 	int tspOrder = getTspOrder();
+ 	//int zero = 0;
+ 	int zero32;
+ 	int zero;
+-
+ 	int context = atomic_fetch_add_relaxed(
+ 		1, &wait_ary[tspOrder].numWait);
+-
++	if (flag < 1000){
++		printk("ron_spinlock_lock, cpu: %d , CORE_COUNT: %d\n", smp_processor_id(), CORE_COUNT);
++		flag += 1;
++	}
+ 	if (unlikely(context >= 4)) {
+ 		while (1) {
+ 			while (atomic_read(&lock->val) != 0)
+ 				cpu_relax();
+ 
+ 			zero32 = 0;
+-			if (atomic_try_cmpxchg_relaxed(
++			if (atomic_try_cmpxchg_acquire(
+ 				    &lock->val, &zero32, 1)) {
+ 				//spinlockAddr[tspOrder][context].addr = NULL;
+ 				//wait_ary[tspOrder].numWait.counter = 1;
+@@ -338,41 +359,47 @@ void ron_spin_lock(struct qspinlock *lock)
+ 			}
+ 		}
+ 	}
+-	spinlockAddr[tspOrder][context].addr = lock;
++	WRITE_ONCE(spinlockAddr[tspOrder][context].addr, lock);
+ 
+ 	while (1) {
+ 		while (atomic_read(&wait_ary[tspOrder].contextField[context]) == 0 &&
+ 		       atomic_read(&lock->val) == 1)
+-			asm("pause");
++			cpu_relax();
+ 
+ 		zero = 1;
+-		if (atomic_try_cmpxchg_relaxed(
++		if (atomic_try_cmpxchg_acquire(
+ 			    &wait_ary[tspOrder].contextField[context], &zero, 0)) {
+ 			return;
+ 		}
+ 
+ 		zero32 = 0;
+-		if (atomic_try_cmpxchg_relaxed(
++		if (atomic_try_cmpxchg_acquire(
+ 			    &lock->val, &zero32, 1)) {
+-			spinlockAddr[tspOrder][context].addr = NULL;
++			WRITE_ONCE(spinlockAddr[tspOrder][context].addr, NULL);
+ 			return;
+ 		}
+ 	}
+ }
++EXPORT_SYMBOL(ron_spin_lock);
+ 
+ void ron_spin_unlock(struct qspinlock *lock)
+ {
+ 	int i;
+ 	int tspOrder = getTspOrder();
+ 	atomic_fetch_sub_release(1, &wait_ary[tspOrder].numWait);
+-
+-	for (i = 0; i < NR_CPUS; i++) {
+-		int idx = (tspOrder + i) % NR_CPUS;
++	if (flag < 1000){
++		printk("ron_spinlock_unlock\n");
++	}
++	//printk("ron_spinlock_unlock\n");
++	//printk("%d", tspOrder);
++	//dump_stack();
++	for (i = 0; i < CORE_COUNT; i++) {
++		int idx = (tspOrder + i) % CORE_COUNT;
+ 		if (atomic_read(&wait_ary[idx].numWait) > 0) {
+ 			int j;
+ 			for (j = 3; j >= 0; j--) {
+-				if (spinlockAddr[idx][j].addr == lock) {
+-					atomic_set(&wait_ary[idx].contextField[j], 1);
++				if (READ_ONCE(spinlockAddr[idx][j].addr) == lock) {
++					atomic_set_release(&wait_ary[idx].contextField[j], 1);
+ 					return;
+ 				}
+ 			}
+@@ -381,6 +408,7 @@ void ron_spin_unlock(struct qspinlock *lock)
+ 	// atomic_set_relaxed()
+ 	atomic_set_release(&lock->val, 0);
+ }
++EXPORT_SYMBOL(ron_spin_unlock);
+ 
+ /**
+  * queued_spin_lock_slowpath - acquire the queued spinlock
+-- 
+2.43.0
+
+
+From 5882c61f7bc2b27f30be95412a6a85be928722bb Mon Sep 17 00:00:00 2001
+From: da267388 <hagud65171@gmail.com>
+Date: Mon, 25 Aug 2025 01:16:10 +0800
+Subject: [PATCH 3/3] ron_spinlock on booting and /sys/kernel/tsp/tsp_path
+ update the path
+
+---
+ Makefile                            |   2 +-
+ include/asm-generic/ron_qspinlock.h |  11 +-
+ kernel/locking/Makefile             |   5 +-
+ kernel/locking/ron_proc.c           |  46 ------
+ kernel/locking/ron_qspinlock.c      | 243 +++++++++++++++++++++++-----
+ kernel/locking/tsp_sysfs.c          | 212 ++++++++++++++++++++++++
+ kernel/locking/tsp_sysfs.h          |  11 ++
+ 7 files changed, 443 insertions(+), 87 deletions(-)
+ delete mode 100644 kernel/locking/ron_proc.c
+ create mode 100644 kernel/locking/tsp_sysfs.c
+ create mode 100644 kernel/locking/tsp_sysfs.h
+
+diff --git a/Makefile b/Makefile
+index 96407c1d6be1..859a1a9e3689 100644
+--- a/Makefile
++++ b/Makefile
+@@ -2,7 +2,7 @@
+ VERSION = 6
+ PATCHLEVEL = 14
+ SUBLEVEL = 0
+-EXTRAVERSION = -rc3
++EXTRAVERSION = -ron-custom
+ NAME = Baby Opossum Posse
+ 
+ # *DOCUMENTATION*
+diff --git a/include/asm-generic/ron_qspinlock.h b/include/asm-generic/ron_qspinlock.h
+index 41cf090be0c0..399da48f921f 100644
+--- a/include/asm-generic/ron_qspinlock.h
++++ b/include/asm-generic/ron_qspinlock.h
+@@ -45,6 +45,9 @@ static __always_inline int queued_spin_is_contended(struct qspinlock *lock)
+ {
+ 	return atomic_read(&lock->val) & ~_Q_LOCKED_MASK;
+ }
++
++extern int ron_spin_trylock(struct qspinlock *lock);
++
+ /**
+  * queued_spin_trylock - try to acquire the queued spinlock
+  * @lock : Pointer to queued spinlock structure
+@@ -52,8 +55,12 @@ static __always_inline int queued_spin_is_contended(struct qspinlock *lock)
+  */
+ static __always_inline int queued_spin_trylock(struct qspinlock *lock)
+ {
++	int val = atomic_read(&lock->val);
+ 
+-	return false;
++	if (unlikely(val))
++		return 0;
++
++	return likely(ron_spin_trylock(lock));
+ }
+ 
+ extern void queued_spin_lock_slowpath(struct qspinlock *lock, u32 val);
+@@ -108,4 +115,6 @@ static __always_inline bool virt_spin_lock(struct qspinlock *lock)
+ #define arch_spin_unlock(l)		queued_spin_unlock(l)
+ #endif
+ 
++void qspinlock_reload_tsp_order(void);
++
+ #endif /* __ASM_GENERRIC_RON_QSPINLOCK_H */
+diff --git a/kernel/locking/Makefile b/kernel/locking/Makefile
+index 50feaaaa37bf..5866fcee86e0 100644
+--- a/kernel/locking/Makefile
++++ b/kernel/locking/Makefile
+@@ -24,9 +24,10 @@ obj-$(CONFIG_SMP) += spinlock.o
+ obj-$(CONFIG_LOCK_SPIN_ON_OWNER) += osq_lock.o
+ obj-$(CONFIG_PROVE_LOCKING) += spinlock.o
+ obj-$(CONFIG_QUEUED_SPINLOCKS) += qspinlock.o
+-obj-$(CONFIG_RON_QUEUED_SPINLOCKS) += ron_route.o
++#obj-$(CONFIG_RON_QUEUED_SPINLOCKS) += ron_route.o
+ obj-$(CONFIG_RON_QUEUED_SPINLOCKS) += ron_qspinlock.o
+-obj-$(CONFIG_RON_QUEUED_SPINLOCKS) += ron_proc.o
++#obj-$(CONFIG_RON_QUEUED_SPINLOCKS) += ron_proc.o
++obj-$(CONFIG_RON_QUEUED_SPINLOCKS) += tsp_sysfs.o
+ obj-$(CONFIG_RT_MUTEXES) += rtmutex_api.o
+ obj-$(CONFIG_PREEMPT_RT) += spinlock_rt.o ww_rt_mutex.o
+ obj-$(CONFIG_DEBUG_SPINLOCK) += spinlock.o
+diff --git a/kernel/locking/ron_proc.c b/kernel/locking/ron_proc.c
+deleted file mode 100644
+index 73db304b04e7..000000000000
+--- a/kernel/locking/ron_proc.c
++++ /dev/null
+@@ -1,46 +0,0 @@
+-#include <linux/proc_fs.h>
+-#include <linux/seq_file.h>
+-#include <linux/init.h>
+-
+-#include "ron_route.h"
+-
+-#define PROC_NAME "ron_core_routing"
+-
+-
+-
+-static int ron_route_show(struct seq_file *m, void *v)
+-{
+-    for (int i = 0; i < ARRAY_SIZE(TSP_ID_ARRAY); i++) {
+-        seq_printf(m, "%d%s", TSP_ID_ARRAY[i], (i < ARRAY_SIZE(TSP_ID_ARRAY) - 1) ? ", " : "\n");
+-    }
+-
+-    return 0;
+-}
+-
+-static int ron_route_open(struct inode *inode, struct file *file)
+-{
+-    return single_open(file, ron_route_show, NULL);
+-}
+-
+-static const struct proc_ops ron_route_proc_ops = 
+-{
+-    .proc_flags	= PROC_ENTRY_PERMANENT,
+-    .proc_open    = ron_route_open,
+-    .proc_read_iter  = seq_read_iter,
+-    .proc_lseek   = seq_lseek,
+-    .proc_release = single_release,
+-};
+-
+-static int __init ron_route_proc_init(void)
+-{
+-    struct proc_dir_entry *entry;
+-
+-    entry = proc_create(PROC_NAME, 0, NULL, &ron_route_proc_ops);
+-    if (!entry) {
+-        pr_err("myvfs: Failed to create /proc/%s\n", PROC_NAME);
+-        return -ENOMEM;
+-    }
+-
+-    return 0;
+-}
+-fs_initcall(ron_route_proc_init);
+\ No newline at end of file
+diff --git a/kernel/locking/ron_qspinlock.c b/kernel/locking/ron_qspinlock.c
+index 633df1156a00..daf8fbc74faf 100644
+--- a/kernel/locking/ron_qspinlock.c
++++ b/kernel/locking/ron_qspinlock.c
+@@ -25,7 +25,8 @@
+ #include <trace/events/lock.h>
+ 
+ 
+-#include "ron_route.h"
++#include "tsp_sysfs.h"
++
+ /*
+  * Include queued spinlock statistics code
+  */
+@@ -301,53 +302,180 @@ struct SpinlockAddress {
+ 	struct qspinlock *addr;
+ };
+ 
+-struct Plock wait_ary[CORE_COUNT] __attribute__((aligned(L1_CACHE_BYTES))) = { 0 };
++static struct Plock wait_ary[NR_CPUS] __attribute__((aligned(L1_CACHE_BYTES))) = { 0 };
+ 
+-struct SpinlockAddress spinlockAddr[CORE_COUNT][4]
++static struct SpinlockAddress spinlockAddr[NR_CPUS][4]
+ 	__attribute__((aligned(L1_CACHE_BYTES))) = { NULL };
+ 
++static int __rcu *next_cpu_map = NULL;
+ 
++static int local_order[NR_CPUS];
++static int local_count = 1;
+ 
+ static __always_inline int getTspOrder(void)
+ {
+-	return TSP_ID_ARRAY[smp_processor_id()];
++	return local_order[smp_processor_id()];
+ }
+ 
+-/*
+-static int __init init_ron_spinlock(void)
++static void map_fill(int *map)
++{
++	int *pos;
++	int i;
++
++	pos = kmalloc_array(local_count, sizeof(int), GFP_KERNEL);
++	if (!pos)
++    	return;
++
++	/* 預設: 照順序 */
++	for (i = 0; i < local_count; i++)
++		map[i] = (i + 1) % local_count;
++
++	for (i = 0; i < local_count; i++) {
++        pos[local_order[i]] = i;
++    }
++
++    // 依 CPU ID 建立 map
++    for (i = 0; i < local_count; i++) {
++        int tspOrder = local_order[i];
++        int next_cpu = pos[(tspOrder + 1) % local_count];
++        map[i] = next_cpu;
++    }
++
++	kfree(pos);
++}
++
++static int next_cpu_init(void)
++{
++	int *map;
++	map = kmalloc_array(local_count, sizeof(int), GFP_KERNEL);
++	if (!map)
++		return -ENOMEM;
++
++	map_fill(map);
++
++	rcu_assign_pointer(next_cpu_map, map);
++	return 0;
++}
++
++static void next_cpu_publish(void)
++{
++	int *new_map, *old;
++	new_map = kmalloc_array(local_count, sizeof(int), GFP_KERNEL);
++	if (!new_map)
++		return;
++
++	map_fill(new_map);
++
++	int i;
++	pr_info("spinlock: new_map =");
++	for_each_present_cpu(i) {
++		pr_info("from %d to %d", i, new_map[i]);
++	}
++
++	/* 發布 */
++	old = rcu_replace_pointer(next_cpu_map, new_map, &tsp_lock);//local_order and local_count can be saw before replacement (could be a problem on hotplugging)
++
++	/* 延遲釋放舊 map */
++	if (old) {
++    	synchronize_rcu();   // 等待所有 RCU 讀者結束
++    	kfree(old);
++		pr_info("qspinlock: old map free");
++	}
++}
++
++static void do_reload_tsp_order(void)
++{
++	
++    int n = get_tsp_order(local_order, NR_CPUS);
++	
++    if (n > 0) {
++        local_count = n;
++        pr_info("qspinlock: reloaded tsp_order with %d entries\n", local_count);
++    } else {
++        pr_warn("qspinlock: failed to reload tsp_order\n");
++    }
++}
++
++static void qspinlock_reload_tsp_order_callback(void)
++{
++    do_reload_tsp_order();
++	next_cpu_publish();
++	int i;
++	pr_info("qspinlock: tsp_order ");
++	for_each_present_cpu(i) {
++		pr_info("%d ", local_order[i]);
++	}
++}
++
++static int __init qspinlock_tsp_order_init(void)
++{
++    do_reload_tsp_order();
++	next_cpu_init();
++	int i;
++	pr_info("qspinlock: default tsp_order ");
++	for_each_present_cpu(i) {
++		pr_info("%d ", local_order[i]);
++	}
++
++    register_tsp_reload_callback(qspinlock_reload_tsp_order_callback);
++
++    return 0;
++}
++early_initcall(qspinlock_tsp_order_init);
++
++int ron_spin_trylock(struct qspinlock *lock)
+ {
+-	pr_info("ron_spinlock: wait_ary and spinlockAddr initialize start\n");
+-	int cpu, i;
+-	for (cpu = 0; cpu < NR_CPUS; cpu++) {
+-		atomic_set(&wait_ary[cpu].numWait, 0);
+-		for (i = 0; i < 4; i++) {
+-			atomic_set(&wait_ary[cpu].contextField[i], 0);
+-			WRITE_ONCE(spinlockAddr[cpu][i].addr, NULL);
++	int tspOrder = getTspOrder();
++	int cpu_id = smp_processor_id();
++	int zero32 = 0;
++	int context;
++
++	if (atomic_try_cmpxchg_acquire(
++		    &lock->val, &zero32, 1)) {
++		context = atomic_fetch_add_relaxed(
++			1, &wait_ary[cpu_id].numWait);
++		if (atomic_read(&lock->val) != 1){
++			pr_warn("qspinlock: lock is not lock!\n");
+ 		}
++		return 1;
+ 	}
+-	pr_info("ron_spinlock: wait_ary and spinlockAddr initialized\n");
++
+ 	return 0;
+ }
+-early_initcall(init_ron_spinlock);*/
+-
+-int flag = 0;
+ 
+ void ron_spin_lock(struct qspinlock *lock)
+ {
+ 	int tspOrder = getTspOrder();
+-	//int zero = 0;
++	int cpu_id = smp_processor_id();
+ 	int zero32;
+ 	int zero;
+ 	int context = atomic_fetch_add_relaxed(
+-		1, &wait_ary[tspOrder].numWait);
+-	if (flag < 1000){
+-		printk("ron_spinlock_lock, cpu: %d , CORE_COUNT: %d\n", smp_processor_id(), CORE_COUNT);
+-		flag += 1;
++		1, &wait_ary[cpu_id].numWait);
++
++	int counter = 0;
++
++	if (context < 0) {
++		pr_warn("context lower than 0!");
+ 	}
++
+ 	if (unlikely(context >= 4)) {
+ 		while (1) {
+-			while (atomic_read(&lock->val) != 0)
++			while (atomic_read(&lock->val) != 0){
+ 				cpu_relax();
++				counter++;
++			if (counter >= 10000000){
++				pr_warn("lock spinning over 10000000");
++				pr_warn("cpu id: %d, tspOrder: %d addr: %pS", smp_processor_id(), tspOrder, lock);
++				for (int i = 0; i < 4; i++){
++					pr_warn("wait_ary [%d]: %d %d %d %d", i, wait_ary[i].contextField[0].counter, wait_ary[i].contextField[1].counter, wait_ary[i].contextField[2].counter, wait_ary[i].contextField[3].counter);
++				}
++				for (int i = 0; i < 4; i++){
++					pr_warn("spinlockAddr [%d]: %pS %pS %pS %pS", i, spinlockAddr[i][0].addr, spinlockAddr[i][1].addr, spinlockAddr[i][2].addr, spinlockAddr[i][3].addr);
++				}
++				dump_stack();
++				BUG();
++				}
++			}
+ 
+ 			zero32 = 0;
+ 			if (atomic_try_cmpxchg_acquire(
+@@ -359,23 +487,45 @@ void ron_spin_lock(struct qspinlock *lock)
+ 			}
+ 		}
+ 	}
+-	WRITE_ONCE(spinlockAddr[tspOrder][context].addr, lock);
++	WRITE_ONCE(spinlockAddr[cpu_id][context].addr, lock);
+ 
+ 	while (1) {
+-		while (atomic_read(&wait_ary[tspOrder].contextField[context]) == 0 &&
+-		       atomic_read(&lock->val) == 1)
++		while (atomic_read(&wait_ary[cpu_id].contextField[context]) == 0 &&
++		       atomic_read(&lock->val) == 1){
+ 			cpu_relax();
++			counter++;
++			if (counter >= 10000000){
++				pr_warn("lock spinning over 10000000");
++				pr_warn("cpu id: %d, tspOrder: %d context: %d addr: %pS", smp_processor_id(), tspOrder, context, lock);
++				for (int i = 0; i < 4; i++){
++					pr_warn("wait_ary [%d]: %d %d %d %d", i, wait_ary[i].contextField[0].counter, wait_ary[i].contextField[1].counter, wait_ary[i].contextField[2].counter, wait_ary[i].contextField[3].counter);
++				}
++				for (int i = 0; i < 4; i++){
++					pr_warn("spinlockAddr [%d]: %pS %pS %pS %pS", i, spinlockAddr[i][0].addr, spinlockAddr[i][1].addr, spinlockAddr[i][2].addr, spinlockAddr[i][3].addr);
++				}
++				dump_stack();
++				BUG();
++				}
++			   }
+ 
+ 		zero = 1;
+ 		if (atomic_try_cmpxchg_acquire(
+-			    &wait_ary[tspOrder].contextField[context], &zero, 0)) {
++			    &wait_ary[cpu_id].contextField[context], &zero, 0)) {
++			WRITE_ONCE(spinlockAddr[cpu_id][context].addr, NULL);
++			//pr_info("tsp_order: %d context: %d get lock addr: %pS", tspOrder, context, lock);
++			if (atomic_read(&lock->val) != 1){
++				pr_warn("qspinlock: call by other lock is not lock!\n");
++			}
+ 			return;
+ 		}
+ 
+ 		zero32 = 0;
+ 		if (atomic_try_cmpxchg_acquire(
+ 			    &lock->val, &zero32, 1)) {
+-			WRITE_ONCE(spinlockAddr[tspOrder][context].addr, NULL);
++			WRITE_ONCE(spinlockAddr[cpu_id][context].addr, NULL);
++			if (atomic_read(&lock->val) != 1){
++				pr_warn("qspinlock: lock is not lock!\n");
++			}
+ 			return;
+ 		}
+ 	}
+@@ -386,27 +536,46 @@ void ron_spin_unlock(struct qspinlock *lock)
+ {
+ 	int i;
+ 	int tspOrder = getTspOrder();
+-	atomic_fetch_sub_release(1, &wait_ary[tspOrder].numWait);
+-	if (flag < 1000){
+-		printk("ron_spinlock_unlock\n");
++	int cpu_id = smp_processor_id();
++	int *map;
++
++	rcu_read_lock();
++	map = rcu_dereference(next_cpu_map);
++
++	atomic_fetch_sub_release(1, &wait_ary[cpu_id].numWait);
++
++	if (unlikely(!map))
++		goto fallback_unlock;
++
++	if (atomic_read(&lock->val) == 0){
++		pr_warn("ron_spin_unlock: lock already unlocked!?\n");
+ 	}
+-	//printk("ron_spinlock_unlock\n");
+-	//printk("%d", tspOrder);
+-	//dump_stack();
+-	for (i = 0; i < CORE_COUNT; i++) {
+-		int idx = (tspOrder + i) % CORE_COUNT;
++
++	int idx = cpu_id;
++	for (i = 0; i < local_count; i++) {
+ 		if (atomic_read(&wait_ary[idx].numWait) > 0) {
+ 			int j;
+ 			for (j = 3; j >= 0; j--) {
+ 				if (READ_ONCE(spinlockAddr[idx][j].addr) == lock) {
+ 					atomic_set_release(&wait_ary[idx].contextField[j], 1);
+-					return;
++					//pr_info("tsp order: %d to tsp_order: %d context: %d addr: %pS", tspOrder, idx, j, lock);
++					goto pass_unlock;
+ 				}
+ 			}
+ 		}
++		idx = map[idx];
+ 	}
++
++
++fallback_unlock:
+ 	// atomic_set_relaxed()
++	rcu_read_unlock();
+ 	atomic_set_release(&lock->val, 0);
++	return;
++
++pass_unlock:
++	rcu_read_unlock();
++	return;
+ }
+ EXPORT_SYMBOL(ron_spin_unlock);
+ 
+diff --git a/kernel/locking/tsp_sysfs.c b/kernel/locking/tsp_sysfs.c
+new file mode 100644
+index 000000000000..5b1e8d28c98b
+--- /dev/null
++++ b/kernel/locking/tsp_sysfs.c
+@@ -0,0 +1,212 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * tsp_sysfs.c - provide /sys/tsp/tsp_path for user-defined CPU order
++ */
++
++#include <linux/init.h>
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/kobject.h>
++#include <linux/mutex.h>
++#include <linux/slab.h>
++#include <linux/cpumask.h>
++#include <linux/smp.h>
++#include <linux/string.h>
++#include <linux/errno.h>
++#include <linux/types.h>
++
++#include "tsp_sysfs.h"
++
++
++static DEFINE_STATIC_KEY_FALSE(tsp_fallback_initialized);
++
++#define MAX_TSP_PATH_LEN 4096
++#define MAX_TSP_CPUS NR_CPUS
++
++/* Global storage for the sysfs string */
++static char tsp_path[MAX_TSP_PATH_LEN];
++
++/* Parsed order array and count */
++static int tsp_order[MAX_TSP_CPUS];
++static int tsp_order_count = 0;
++
++/* Synchronization lock */
++DEFINE_MUTEX(tsp_lock);
++
++/* kobject for /sys/tsp */
++static struct kobject *tsp_kobj;
++
++#define MAX_TSP_CALLBACKS 8
++
++static tsp_reload_callback_t tsp_reload_callbacks[MAX_TSP_CALLBACKS];
++static int tsp_callback_count;
++
++int register_tsp_reload_callback(tsp_reload_callback_t cb)
++{
++    if (tsp_callback_count >= MAX_TSP_CALLBACKS)
++        return -ENOMEM;
++
++    tsp_reload_callbacks[tsp_callback_count++] = cb;
++    return 0;
++}
++EXPORT_SYMBOL(register_tsp_reload_callback);
++
++
++static void init_fallback_tsp_order(void)
++{
++    int i, count = 0;
++
++    pr_info("tsp_sysfs: fallback initializing tsp_order\n");
++
++    for_each_present_cpu(i) {
++        tsp_order[i] = i;
++        count++;
++    }
++
++    tsp_order_count = count;
++
++    static_branch_enable(&tsp_fallback_initialized);
++}
++
++
++/**
++ * parse_tsp_path_locked() - parse tsp_path into tsp_order
++ * Caller must hold tsp_lock.
++ */
++static void parse_tsp_path_locked(void)
++{
++    char *buf, *str, *token;
++    int count = 0;
++
++    buf = kstrdup(tsp_path, GFP_KERNEL);
++    if (!buf)
++        return;
++
++    str = buf;
++
++    while ((token = strsep(&str, " ")) != NULL && count < MAX_TSP_CPUS) {
++        int cpu;
++        if (kstrtoint(token, 10, &cpu) == 0) {
++            tsp_order[count++] = cpu;
++        }
++    }
++
++    tsp_order_count = count;
++
++    kfree(buf);
++}
++
++/**
++ * tsp_show() - sysfs read
++ */
++static ssize_t tsp_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
++{
++    ssize_t ret;
++
++    mutex_lock(&tsp_lock);
++    ret = sysfs_emit(buf, "%s\n", tsp_path);
++    mutex_unlock(&tsp_lock);
++
++    return ret;
++}
++
++/**
++ * tsp_store() - sysfs write
++ */
++static ssize_t tsp_store(struct kobject *kobj, struct kobj_attribute *attr,
++                         const char *buf, size_t count)
++{
++    size_t copy_count = min(count, (size_t)(MAX_TSP_PATH_LEN - 1));
++
++    mutex_lock(&tsp_lock);
++
++    /* Copy user input, remove trailing newline if any */
++    strncpy(tsp_path, buf, copy_count);
++    tsp_path[copy_count] = '\0';
++
++    strim(tsp_path); // Trim leading/trailing spaces/newlines
++
++    parse_tsp_path_locked();
++
++    for (int i = 0; i < tsp_callback_count; ++i)
++        tsp_reload_callbacks[i]();
++
++    mutex_unlock(&tsp_lock);
++
++    pr_info("tsp_sysfs: updated tsp_path='%s' (count=%d)\n",
++            tsp_path, tsp_order_count);
++
++    return count;
++}
++
++/* sysfs attribute */
++static struct kobj_attribute tsp_attr = __ATTR(tsp_path, 0664, tsp_show, tsp_store);
++
++/**
++ * tsp_sysfs_init() - initialize /sys/tsp/tsp_path
++ */
++static int __init tsp_sysfs_init(void)
++{
++    int ret;
++    int i;
++    char *p = tsp_path;
++
++    /* Default: 0 1 2 ... online_cpu -1 */
++    for_each_online_cpu(i) {
++        p += scnprintf(p, MAX_TSP_PATH_LEN - (p - tsp_path), "%d ", i);
++    }
++
++    pr_info("tsp_sysfs: default tsp_path='%s'\n", tsp_path);
++
++    mutex_lock(&tsp_lock);
++    parse_tsp_path_locked();
++
++    for (int i = 0; i < tsp_callback_count; ++i)
++        tsp_reload_callbacks[i]();
++
++    mutex_unlock(&tsp_lock);
++
++    /* Create /sys/kernel/tsp/tsp_path */
++    tsp_kobj = kobject_create_and_add("tsp", kernel_kobj);
++    if (!tsp_kobj)
++        return -ENOMEM;
++
++    ret = sysfs_create_file(tsp_kobj, &tsp_attr.attr);
++    if (ret) {
++        kobject_put(tsp_kobj);
++        return ret;
++    }
++
++    pr_info("tsp_sysfs: sysfs interface initialized\n");
++    return 0;
++}
++
++device_initcall(tsp_sysfs_init);
++
++/**
++ * get_tsp_order() - Exported API for other kernel code
++ * @array: buffer to fill
++ * @max_entries: buffer size
++ *
++ * Returns the number of entries copied.
++ */
++int get_tsp_order(int *array, int max_entries)
++{
++    int i;
++
++    if (!static_branch_likely(&tsp_fallback_initialized)) {
++        init_fallback_tsp_order();
++        pr_info("tsp_sysfs: get_tsp_order fallback to present CPU default path, count=%d\n", tsp_order_count);
++
++        for (i = 0; i < tsp_order_count && i < max_entries; i++)
++            array[i] = tsp_order[i];
++
++        return tsp_order_count;
++    }
++
++
++    for (i = 0; i < tsp_order_count && i < max_entries; i++)
++        array[i] = tsp_order[i];
++
++    return i;
++}
+\ No newline at end of file
+diff --git a/kernel/locking/tsp_sysfs.h b/kernel/locking/tsp_sysfs.h
+new file mode 100644
+index 000000000000..ab318724fc5c
+--- /dev/null
++++ b/kernel/locking/tsp_sysfs.h
+@@ -0,0 +1,11 @@
++#ifndef _TSP_SYSFS_H
++#define _TSP_SYSFS_H
++
++extern struct mutex tsp_lock;
++
++typedef void (*tsp_reload_callback_t)(void);
++
++int get_tsp_order(int *array, int max_entries);
++int register_tsp_reload_callback(tsp_reload_callback_t cb);
++
++#endif
+\ No newline at end of file
+-- 
+2.43.0
+
