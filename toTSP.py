@@ -81,7 +81,7 @@ if __name__ == "__main__":
     write_tsp_order_to_csv(order, output_file)
     
     print("TSP order 已輸出至:", output_file)
-    print("TSP Path:", path)
+    print("TSP Path:", path[:-1])
     print("Execution Order:", order)
     print(f"Total Latency (approx): {cost:.2f} ns")
     
