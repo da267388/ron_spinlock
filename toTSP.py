@@ -4,18 +4,21 @@ import csv
 # --- Step 1: 讀取下三角矩陣並補全對稱矩陣 ---
 def read_lower_triangular_csv(file_path):
     with open(file_path, 'r') as f:
-        lines = f.readlines()
-    data = []
-    for line in lines:
-        row = [float(x.strip()) for x in line.strip().split(',') if x.strip()]
-        if row:
-            data.append(row)
-    n = len(data)
+        lines = [line.strip() for line in f.readlines() if line.strip()]
+    
+    n = len(lines)  # 矩陣大小就是行數
     matrix = np.zeros((n, n))
+    
+    # 逐行解析下三角矩陣
     for i in range(n):
-        for j in range(len(data[i])):
-            matrix[i][j] = data[i][j]
-            matrix[j][i] = data[i][j]
+        values = [x.strip() for x in lines[i].split(',')]
+        # 填入這一行的數據（只考慮下三角部分）
+        for j in range(i):  # j < i，下三角部分
+            if j < len(values) and values[j]:  # 確保有數值
+                val = float(values[j])
+                matrix[i][j] = val
+                matrix[j][i] = val  # 對稱填入
+    
     return matrix
 
 # --- Step 2: Nearest Neighbor TSP 啟發式解法 ---
