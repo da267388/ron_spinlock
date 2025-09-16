@@ -72,8 +72,8 @@ def write_tsp_order_to_csv(order, output_file):
 
 # --- Step 5: 主程式 ---
 if __name__ == "__main__":
-    input_file = "./core-to-core-latency/output.csv"          # ← 輸入檔名
-    output_file = "tsp_order.csv"       # ← 輸出檔名
+    input_file = "/home/yunhsihsu/RON_TSP/tsp_order/output.csv"          # ← 輸入檔名
+    output_file = "/home/yunhsihsu/RON_TSP/tsp_order.csv"       # ← 輸出檔名
     
     matrix = read_lower_triangular_csv(input_file)
     path, cost = tsp_nearest_neighbor(matrix)
