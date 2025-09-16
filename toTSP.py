@@ -5,13 +5,11 @@ import csv
 def read_lower_triangular_csv(file_path):
     with open(file_path, 'r') as f:
         lines = f.readlines()
-
     data = []
     for line in lines:
         row = [float(x.strip()) for x in line.strip().split(',') if x.strip()]
         if row:
             data.append(row)
-
     n = len(data)
     matrix = np.zeros((n, n))
     for i in range(n):
@@ -28,7 +26,8 @@ def tsp_nearest_neighbor(matrix, start=0):
     visited[start] = True
     cost = 0
     current = start
-
+    
+    # 訪問所有其他節點
     for _ in range(n - 1):
         next_node = None
         min_latency = float('inf')
@@ -42,28 +41,48 @@ def tsp_nearest_neighbor(matrix, start=0):
         visited[next_node] = True
         cost += min_latency
         current = next_node
-
+    
+    # 回到起點完成TSP循環
+    cost += matrix[current][start]
+    path.append(start)
+    
     return path, cost
 
+# --- Step 3: 將路徑轉換為執行順序 ---
+def path_to_order(path):
+    """
+    將TSP路徑轉換為執行順序
+    path: [0,3,1,2,0] -> order: [0,2,3,1]
+    意思是: core 0 第0個執行, core 1 第2個執行, core 2 第3個執行, core 3 第1個執行
+    """
+    n = len(path) - 1  # 去掉最後回到起點的節點
+    order = [0] * n
+    for position, core_id in enumerate(path[:-1]):  # 排除最後的起點
+        order[core_id] = position
+    return order
 
-
-# --- Step 3: 輸出為一列 CSV ---
+# --- Step 4: 輸出為一列 CSV ---
 def write_tsp_order_to_csv(order, output_file):
     with open(output_file, 'w', newline='') as f:
         writer = csv.writer(f)
         writer.writerow(order)
 
-# --- Step 4: 主程式 ---
+# --- Step 5: 主程式 ---
 if __name__ == "__main__":
     input_file = "./core-to-core-latency/output.csv"          # ← 輸入檔名
     output_file = "tsp_order.csv"       # ← 輸出檔名
-
+    
     matrix = read_lower_triangular_csv(input_file)
-    order, cost = tsp_nearest_neighbor(matrix)
-
+    path, cost = tsp_nearest_neighbor(matrix)
+    order = path_to_order(path)
     write_tsp_order_to_csv(order, output_file)
-
+    
     print("TSP order 已輸出至:", output_file)
-    print("Order:", order)
+    print("TSP Path:", path)
+    print("Execution Order:", order)
     print(f"Total Latency (approx): {cost:.2f} ns")
-
+    
+    # 驗證結果
+    print("\n--- 驗證 ---")
+    for core_id, execution_order in enumerate(order):
+        print(f"Core {core_id} 在第 {execution_order} 個位置執行")
