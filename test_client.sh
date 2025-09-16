@@ -4,7 +4,7 @@ USER="yunhsihsu"
 CPU_MODEL=$(lscpu | grep "Model name" | cut -d ':' -f 2 | sed 's/^ *//')
 echo "[Client] CPU 型號：$CPU_MODEL"
 
-RESPONSE=$(ssh ${USER}@${SERVER} "bash ~/RON_TSP/test_server.sh \"$CPU_MODEL\"")
+RESPONSE=$(ssh ${USER}@${SERVER} "bash ~/test_server.sh \"$CPU_MODEL\"")
 
 if [[ "$RESPONSE" == FOUND* ]]; then
     echo "[Client] Server 查到 TSP 排序："
@@ -24,15 +24,14 @@ else
     fi
     cd core-to-core-latency
     cargo install core-to-core-latency
-    ./target/release/core-to-core-latency 5000 --csv > output.csv
+    core-to-core-latency 5000 --csv > output.csv
     cd ..
 
     echo "[Client] 傳送 output.csv 到 server"
     scp core-to-core-latency/output.csv ${USER}@${SERVER}:~/RON_TSP/tmp/output.csv
 
-    TSP_RESULT=$(ssh ${USER}@${SERVER} "bash ~/RON_TSP/test_result.sh \"$CPU_MODEL\" ~/server/tmp/output.csv")
+    TSP_RESULT=$(ssh ${USER}@${SERVER} "bash ~/test_result.sh \"$CPU_MODEL\" ~/RON_TSP/tmp/output.csv")
 
     echo "[Client] 收到的 TSP 排序結果："
     echo "$TSP_RESULT"
 fi
-
