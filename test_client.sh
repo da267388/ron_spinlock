@@ -9,6 +9,7 @@ RESPONSE=$(ssh ${USER}@${SERVER} "bash ~/test_server.sh \"$CPU_MODEL\"")
 if [[ "$RESPONSE" == FOUND* ]]; then
     echo "[Client] Server 查到 TSP 排序："
     echo "$RESPONSE"
+    echo "$RESPONSE"   | awk 'NF{last=$0} END{print last}' > result.txt
 else
     echo "[Client] Server 沒有資料，準備測量 core-to-core latency..."
 
@@ -34,4 +35,5 @@ else
 
     echo "[Client] 收到的 TSP 排序結果："
     echo "$TSP_RESULT"
+    echo "$TSP_RESULT" | awk 'NF{last=$0} END{print last}' > result.txt
 fi
