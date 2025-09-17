@@ -25,7 +25,7 @@ python3 ~/toTSP.py
 
 # 假設 toTSP.py 會產生 ~/server/tsp_order.csv
 TSP_FILE=$BASE_PATH/RON_TSP/tsp_order.csv
-FINAL_TSP_FILE="$RESULT_DIR/${SAFE_MODEL}_tsp_order.csv"
+FINAL_TSP_FILE="$RESULT_DIR/$SAFE_MODEL/tsp_order.csv"
 
 if [ -f "$TSP_FILE" ]; then
     mv "$TSP_FILE" "$FINAL_TSP_FILE"

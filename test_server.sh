@@ -18,15 +18,20 @@ cd $HOME
 
 RESULT_DIR=$BASE_PATH/RON_TSP/tsp_order
 SAFE_MODEL=$(echo "$CPU_MODEL" | tr ' ' '_' | tr -d '()')
-TSP_FILE="$RESULT_DIR/${SAFE_MODEL}_tsp_order.csv"
+TSP_FILE="$RESULT_DIR/$SAFE_MODEL/tsp_order.csv"
 
-if [ -f "$TSP_FILE" ]; then
+if [ -d "./RON_TSP/tsp_order/$SAFE_MODEL" ]; then
     echo "FOUND"
+    cd ./RON_TSP/tsp_order/$SAEE_MODEL
     # 回傳檔案內容（轉成單一行字串）
     #tr '\n' ' ' < "$TSP_FILE"
     paste -sd' ' "$TSP_FILE"
+    cd $HOME
 
 else
+    cd ./RON_TSP/tsp_order
     echo "NOT_FOUND"
+    mkdir $SAFE_MODEL
+    cd $HOME
 fi
 
