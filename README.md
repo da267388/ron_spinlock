@@ -1,2 +1,2 @@
 # ron_spinlock
-linux kernel 6.14
+using linux kernel 6.14.0-rc3
