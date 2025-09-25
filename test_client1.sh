@@ -1,8 +1,13 @@
 #!/bin/bash
 SERVER="172.16.1.72"
 USER="yunhsihsu"
+
+# 檢查參數：需要的總測量次數（預設為5次）
+REQUIRED_MEASUREMENTS=${1:-5}
+
 CPU_MODEL=$(lscpu | grep "Model name" | cut -d ':' -f 2 | sed 's/^ *//')
 echo "[Client] CPU 型號：$CPU_MODEL"
+echo "[Client] 需要的總測量次數：$REQUIRED_MEASUREMENTS"
 
 # 函數：暫停非關鍵進程
 pause_processes() {
@@ -58,23 +63,34 @@ resume_processes() {
     echo "[Client] 已恢復 ${#SUSPENDED_PIDS[@]} 個進程和系統服務"
 }
 
-# 設置陷阱以確保即使腳本異常退出也能恢復進程
-trap 'resume_processes; exit 1' INT TERM EXIT
+# 檢查server端現有的測量次數
+echo "[Client] 檢查server端現有測量資料..."
+RESPONSE=$(ssh ${USER}@${SERVER} "bash ~/test_server1.sh \"$CPU_MODEL\" $REQUIRED_MEASUREMENTS")
 
-# 檢查是否有足夠的測量次數（可以作為參數傳入，預設為5次）
-REQUIRED_MEASUREMENTS=${1:-5}
-
-# 檢查server端是否有足夠的測量資料
-RESPONSE=$(ssh ${USER}@${SERVER} "bash ~/test_server.sh \"$CPU_MODEL\" $REQUIRED_MEASUREMENTS")
-
+# 解析回應
 if [[ "$RESPONSE" == SUFFICIENT* ]]; then
-    echo "[Client] Server 已有足夠測量資料，使用平均值計算的 TSP 排序："
-    echo "$RESPONSE"
-    echo "$RESPONSE" | awk 'NF{last=$0} END{print last}' > result.txt
-else
-    echo "[Client] Server 測量資料不足，準備進行新的測量..."
-    echo "回應內容: $RESPONSE"
+    echo "[Client] Server 已有足夠測量資料，直接使用現有結果："
+    echo "$RESPONSE" | sed '1d' > result.txt
+    echo "[Client] 結果已儲存至 result.txt"
+    exit 0
     
+elif [[ "$RESPONSE" == NEED_MORE* ]]; then
+    # 解析還需要幾次測量
+    CURRENT_COUNT=$(echo "$RESPONSE" | grep -o "CURRENT:[0-9]*" | cut -d: -f2)
+    NEEDED_COUNT=$(echo "$RESPONSE" | grep -o "NEED:[0-9]*" | cut -d: -f2)
+    
+    echo "[Client] 當前測量次數：$CURRENT_COUNT"
+    echo "[Client] 還需要測量：$NEEDED_COUNT 次"
+    echo "[Client] 準備補足剩餘測量..."
+    
+    MEASUREMENT_TIMES=$NEEDED_COUNT
+else
+    echo "[Client] Server 沒有測量資料，需要進行 $REQUIRED_MEASUREMENTS 次測量"
+    MEASUREMENT_TIMES=$REQUIRED_MEASUREMENTS
+fi
+
+# 如果需要測量，準備測量環境
+if [ "$MEASUREMENT_TIMES" -gt 0 ]; then
     # 安裝依賴
     if ! command -v cargo &> /dev/null; then
         echo "[Client] 安裝 Rust 和相關依賴..."
@@ -90,34 +106,78 @@ else
     cd core-to-core-latency
     cargo install core-to-core-latency
     
+    echo "[Client] 準備開始 $MEASUREMENT_TIMES 次測量，設置進程暫停機制..."
+    
+    # 設置陷阱以確保即使腳本異常退出也能恢復進程
+    trap 'resume_processes; exit 1' INT TERM EXIT
+    
     # 在測量前暫停進程
     pause_processes
     
-    echo "[Client] 開始測量 core-to-core latency（進程已暫停）..."
-    sleep 2  # 讓系統穩定
+    # 存儲所有測量檔案的名稱
+    MEASUREMENT_FILES=()
     
-    # 生成帶時間戳的檔案名稱
-    TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-    OUTPUT_FILE="output_${TIMESTAMP}.csv"
-    
-    # 執行測量
-    core-to-core-latency 5000 --csv > "$OUTPUT_FILE"
+    # 執行多次測量
+    for i in $(seq 1 $MEASUREMENT_TIMES); do
+        echo "[Client] 開始第 $i/$MEASUREMENT_TIMES 次測量..."
+        sleep 2  # 讓系統穩定
+        
+        # 生成帶時間戳和序號的檔案名稱
+        TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+        OUTPUT_FILE="output_${TIMESTAMP}_${i}.csv"
+        
+        # 執行測量
+        echo "[Client] 執行 core-to-core-latency..."
+        core-to-core-latency 5000 --csv > "$OUTPUT_FILE"
+        
+        # 檢查檔案是否成功生成
+        if [ -f "$OUTPUT_FILE" ] && [ -s "$OUTPUT_FILE" ]; then
+            MEASUREMENT_FILES+=("$OUTPUT_FILE")
+            echo "[Client] 第 $i 次測量完成：$OUTPUT_FILE"
+        else
+            echo "[Client] 第 $i 次測量失敗，檔案未生成或為空"
+        fi
+        
+        # 如果不是最後一次測量，等待一下
+        if [ $i -lt $MEASUREMENT_TIMES ]; then
+            echo "[Client] 等待 3 秒後進行下一次測量..."
+            sleep 3
+        fi
+    done
     
     # 測量完成後立即恢復進程
     resume_processes
     
     cd ..
-    echo "[Client] 傳送 $OUTPUT_FILE 到 server"
-    scp "core-to-core-latency/$OUTPUT_FILE" ${USER}@${SERVER}:~/RON_TSP/tmp/$OUTPUT_FILE
     
-    # 傳送測量資料到server並獲取結果
-    TSP_RESULT=$(ssh ${USER}@${SERVER} "bash ~/test_result.sh \"$CPU_MODEL\" ~/RON_TSP/tmp/$OUTPUT_FILE $REQUIRED_MEASUREMENTS")
-    echo "[Client] 收到的結果："
+    echo "[Client] 測量完成，共產生 ${#MEASUREMENT_FILES[@]} 個檔案"
+    
+    # 如果沒有成功的測量檔案，退出
+    if [ ${#MEASUREMENT_FILES[@]} -eq 0 ]; then
+        echo "[Client] 錯誤：沒有成功的測量檔案"
+        trap - INT TERM EXIT
+        exit 1
+    fi
+    
+    # 將所有測量檔案傳送到server
+    echo "[Client] 傳送測量檔案到 server..."
+    for file in "${MEASUREMENT_FILES[@]}"; do
+        echo "[Client] 傳送 $file"
+        scp "core-to-core-latency/$file" ${USER}@${SERVER}:~/RON_TSP/tmp/$file
+    done
+    
+    # 通知server處理這批測量資料並計算TSP
+    echo "[Client] 通知 server 處理測量資料..."
+    TSP_RESULT=$(ssh ${USER}@${SERVER} "bash ~/test_result1.sh \"$CPU_MODEL\" $REQUIRED_MEASUREMENTS")
+    
+    echo "[Client] 收到的TSP結果："
     echo "$TSP_RESULT"
     
     # 從結果中提取最後一行（TSP順序）
     echo "$TSP_RESULT" | awk 'NF{last=$0} END{print last}' > result.txt
+    
+    # 清除陷阱（因為正常執行完成）
+    trap - INT TERM EXIT
+    
+    echo "[Client] 所有測量和計算完成，結果已儲存至 result.txt"
 fi
-
-# 清除陷阱（因為正常執行完成）
-trap - INT TERM EXIT
