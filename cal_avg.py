@@ -82,11 +82,17 @@ def calculate_average_matrix(measurement_folder, measurement_count):
     
     return average_latencies
 
-def matrix_to_or_tools_format(average_latencies):
+def write_symmetric_matrix_csv(average_latencies, output_file):
     """
-    將矩陣轉換為OR-Tools TSP格式的完整方陣
-    下三角 + 對角線 + 上三角 (使用對稱性)
-    返回: [(core1, core2, latency), ...]
+    將平均latency寫入對稱矩陣格式的CSV檔案
+    格式: 行列都是core編號，值是latency
+    
+    範例輸出:
+    ,0,1,2,3
+    0,0,10.5,15.3,20.1
+    1,10.5,0,12.4,18.2
+    2,15.3,12.4,0,22.5
+    3,20.1,18.2,22.5,0
     """
     # 找出所有core編號
     cores = set()
@@ -97,60 +103,59 @@ def matrix_to_or_tools_format(average_latencies):
     max_core = max(cores)
     print(f'Core編號範圍: 0 到 {max_core}')
     
-    # 創建完整的方陣
-    matrix = []
+    # 建立完整的對稱矩陣
+    matrix_size = max_core + 1
+    matrix = [[0.0 for _ in range(matrix_size)] for _ in range(matrix_size)]
     
-    for i in range(max_core + 1):
-        for j in range(max_core + 1):
+    # 填充矩陣
+    for i in range(matrix_size):
+        for j in range(matrix_size):
             if i == j:
-                # 對角線：設為0（TSP中通常為0）
-                latency = 0
+                # 對角線為0
+                matrix[i][j] = 0
             elif (i, j) in average_latencies:
-                # 下三角或上三角已有資料
-                latency = average_latencies[(i, j)]
+                # 使用實際測量值
+                matrix[i][j] = average_latencies[(i, j)]
             elif (j, i) in average_latencies:
-                # 利用對稱性：如果有(j,i)則使用該值（假設是對稱的）
-                latency = average_latencies[(j, i)]
+                # 利用對稱性
+                matrix[i][j] = average_latencies[(j, i)]
             else:
                 # 缺失資料（不應該出現）
-                latency = 0
+                matrix[i][j] = 0
                 print(f'[警告] 缺失資料: ({i},{j})')
-            
-            matrix.append((i, j, latency))
     
-    return matrix
-
-def write_or_tools_csv(matrix, output_file):
-    """
-    寫入OR-Tools格式的CSV檔案
-    格式: from,to,distance
-    """
+    # 寫入CSV檔案
     try:
         with open(output_file, 'w', newline='') as f:
             writer = csv.writer(f)
-            writer.writerow(['from', 'to', 'distance'])
             
-            for core1, core2, latency in matrix:
-                writer.writerow([core1, core2, latency])
+            # 寫入標題行（列編號）
+            header = [''] + list(range(matrix_size))
+            writer.writerow(header)
+            
+            # 寫入每一行
+            for i in range(matrix_size):
+                row = [i] + matrix[i]
+                writer.writerow(row)
         
-        print(f'\n✅ OR-Tools格式CSV已儲存: {output_file}')
-        return True
+        print(f'\n✅ 對稱矩陣CSV已儲存: {output_file}')
+        return True, matrix_size
     except Exception as e:
         print(f'[錯誤] 寫入檔案失敗: {e}')
-        return False
+        return False, 0
 
-def print_matrix_info(matrix, max_core):
+def print_matrix_info(matrix_size, average_latencies):
     """
     打印矩陣資訊
     """
     print(f'\n=== 矩陣資訊 ===')
-    print(f'矩陣大小: {max_core + 1} x {max_core + 1}')
-    print(f'總資料點: {len(matrix)}')
+    print(f'矩陣大小: {matrix_size} x {matrix_size}')
     
     # 提取距離值（排除對角線）
-    distances = [latency for _, _, latency in matrix if latency > 0]
+    distances = [latency for latency in average_latencies.values() if latency > 0]
     if distances:
         print(f'距離統計:')
+        print(f'  資料點數: {len(distances)}')
         print(f'  最小: {min(distances):.2f}')
         print(f'  最大: {max(distances):.2f}')
         print(f'  平均: {np.mean(distances):.2f}')
@@ -188,33 +193,35 @@ def main():
     
     print(f'  成功計算 {len(average_latencies)} 個位置的平均值')
     
-    # 轉換為OR-Tools格式
-    print('\n步驟2: 轉換為OR-Tools格式...')
-    matrix = matrix_to_or_tools_format(average_latencies)
-    
-    max_core = max([core1 for core1, _, _ in matrix])
-    print(f'  轉換完成，矩陣大小: {max_core + 1} x {max_core + 1}')
-    
-    # 寫入檔案
-    print('\n步驟3: 寫入輸出檔案...')
+    # 寫入對稱矩陣CSV檔案
+    print('\n步驟2: 建立對稱矩陣並寫入CSV...')
     Path(output_file).parent.mkdir(parents=True, exist_ok=True)
     
-    if write_or_tools_csv(matrix, output_file):
+    success, matrix_size = write_symmetric_matrix_csv(average_latencies, output_file)
+    
+    if success:
         # 打印矩陣資訊
-        print_matrix_info(matrix, max_core)
+        print_matrix_info(matrix_size, average_latencies)
         
-        # 顯示前幾行
-        print('\n=== 檔案預覽 ===')
+        # 顯示檔案預覽
+        print('\n=== 檔案預覽 (前6行6列) ===')
         with open(output_file, 'r') as f:
             for i, line in enumerate(f):
                 if i < 6:
-                    print(f'  {line.strip()}')
+                    # 只顯示前幾個欄位
+                    parts = line.strip().split(',')
+                    if len(parts) > 6:
+                        display_parts = parts[:6] + ['...']
+                    else:
+                        display_parts = parts
+                    print(f'  {",".join(display_parts)}')
                 else:
                     print(f'  ...')
                     break
         
         print(f'\n🎉 處理完成！')
         print(f'輸出檔案: {output_file}')
+        print(f'矩陣格式: {matrix_size} x {matrix_size} 對稱矩陣')
         sys.exit(0)
     else:
         sys.exit(1)
