@@ -157,7 +157,7 @@ def print_matrix_info(matrix):
 
 def main():
     if len(sys.argv) < 3:
-        print('使用方式: python3 calculate_average.py <measurement_folder> <output_file> [measurement_count]')
+        print('使用方式: python3 cal_avg.py <measurement_folder> <output_file> [measurement_count]')
         print('\n範例:')
         print('  python3 calculate_average.py ~/RON_TSP/measurements/CPU_MODEL output.csv')
         print('  python3 calculate_average.py ~/RON_TSP/measurements/CPU_MODEL output.csv 5')
