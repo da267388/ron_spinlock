@@ -45,69 +45,7 @@ if [ $TOTAL_MEASUREMENT_COUNT -ge $REQUIRED_MEASUREMENTS ]; then
     echo "[Server] 測量次數已足夠，開始計算平均latency並執行TSP計算..."
     
     # 使用Python腳本來計算所有測量的平均值
-    python3 -c "
-import csv
-import os
-from collections import defaultdict
-import numpy as np
-
-measurement_folder = '$MEASUREMENT_FOLDER'
-base_path = '$BASE_PATH'
-required_measurements = $REQUIRED_MEASUREMENTS
-
-# 讀取所有測量檔案
-all_latencies = defaultdict(list)
-csv_files = [f for f in os.listdir(measurement_folder) if f.startswith('output_') and f.endswith('.csv')]
-csv_files.sort()  # 確保順序一致
-
-print(f'[Server] 找到 {len(csv_files)} 個測量檔案，將使用前 {required_measurements} 個進行計算')
-
-# 只使用前N個檔案來確保一致性
-csv_files = csv_files[:required_measurements]
-
-for csv_file in csv_files:
-    file_path = os.path.join(measurement_folder, csv_file)
-    print(f'[Server] 處理檔案: {csv_file}')
-    
-    try:
-        with open(file_path, 'r') as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                core1 = int(row['core1'])
-                core2 = int(row['core2'])
-                latency = float(row['latency'])
-                
-                # 使用sorted tuple作為key以確保一致性
-                key = tuple(sorted([core1, core2]))
-                all_latencies[key].append(latency)
-    except Exception as e:
-        print(f'[Server] 讀取檔案 {csv_file} 時出錯: {e}')
-        continue
-
-if not all_latencies:
-    print('[Server] 錯誤：沒有找到有效的測量資料')
-    exit(1)
-
-# 計算平均latency
-output_file = os.path.join(base_path, 'RON_TSP', 'tsp_order', 'output.csv')
-with open(output_file, 'w', newline='') as f:
-    writer = csv.writer(f)
-    writer.writerow(['core1', 'core2', 'latency'])
-    
-    processed_pairs = 0
-    for (core1, core2), latencies in sorted(all_latencies.items()):
-        if len(latencies) > 0:
-            avg_latency = np.mean(latencies)
-            std_latency = np.std(latencies) if len(latencies) > 1 else 0
-            writer.writerow([core1, core2, avg_latency])
-            processed_pairs += 1
-            
-            # 輸出統計資訊
-            print(f'[Server] Core {core1}-{core2}: {len(latencies)} 次測量, 平均 {avg_latency:.2f}, 標準差 {std_latency:.2f}')
-
-print(f'[Server] 成功處理 {processed_pairs} 個core pair')
-print(f'[Server] 平均latency已寫入: {output_file}')
-"
+    python3 $BASE_PATH/cal_avg.py $MEASUREMENT_FOLDER $BASE_PATH/RON_TSP/tsp_order/output.csv
     
     # 檢查平均latency檔案是否成功產生
     AVERAGE_FILE="$BASE_PATH/RON_TSP/tsp_order/output.csv"
@@ -115,7 +53,8 @@ print(f'[Server] 平均latency已寫入: {output_file}')
         echo "[Server] 執行 TSP 計算..."
         
         # 執行 TSP 計算
-        python3 ~/toTSP.py 
+        source $BASE_PATH/venv/bin/activate
+        python3 $BASE_PATH/tsp.py 
         
         # 假設 toTSP.py 會產生 ~/RON_TSP/tsp_order.csv
         TSP_FILE="$BASE_PATH/RON_TSP/tsp_order.csv"
