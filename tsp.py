@@ -5,7 +5,7 @@ from ortools.constraint_solver import pywrapcp
 
 def read_distance_matrix_from_csv(csv_file):
     """
-    從 CSV 檔案讀取距離矩陣
+          從 CSV 檔案讀取距離矩陣
     
     參數:
         csv_file: CSV 檔案路徑
@@ -136,12 +136,28 @@ def solve_tsp(distance_matrix, start_node=0, time_limit=30):
     else:
         return None, None
 
+def path_to_order(path):
+    """
+    將TSP路徑轉換為執行順序
+    path: [0,3,1,2,0] -> order: [0,2,3,1]
+    意思是: core 0 第0個執行, core 1 第2個執行, core 2 第3個執行, core 3 第1個執行
+    """
+    n = len(path) - 1  # 去掉最後回到起點的節點
+    order = [0] * n
+    for position, core_id in enumerate(path[:-1]):  # 排除最後的起點
+        order[core_id] = position
+    return order
+
+def write_tsp_order_to_csv(order, output_file):
+    with open(output_file, 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(order)
 
 def main():
     """主程式"""
     # CSV 檔案路徑
-    csv_file = 'test.csv'
-    
+    csv_file = 'RON_TSP/tsp_order/output.csv'
+    output_file="RON_TSP/tsp_order.csv"
     try:
         # 讀取距離矩陣
         print(f"正在讀取 CSV 檔案: {csv_file}")
@@ -161,12 +177,15 @@ def main():
         # 求解 TSP
         print("\n正在求解 TSP 問題...")
         route, total_distance = solve_tsp(distance_matrix, start_node=0)
+        order=path_to_order(route)
+        write_tsp_order_to_csv(order, output_file)
         
         if route:
             print("\n=== 結果 ===")
             print(f"經過的點的順序: {route}")
             print(f"不含返回起點: {route[:-1]}")
-            print(f"總距離: {total_distance}")
+            print("Execution Order:", order)
+            print(f"總距離: {total_distance:.2f}")
             
             # 詳細路徑
             print("\n=== 詳細路徑 ===")
@@ -187,7 +206,7 @@ def main():
         print("20,25,30,0")
     except Exception as e:
         print(f"錯誤: {e}")
-
+    
 
 if __name__ == '__main__':
     main()
