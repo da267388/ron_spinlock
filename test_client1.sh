@@ -3,7 +3,7 @@ SERVER="172.16.1.72"
 USER="yunhsihsu"
 
 # 檢查參數：需要的總測量次數（預設為5次）
-REQUIRED_MEASUREMENTS=${1:-5}
+REQUIRED_MEASUREMENTS=${1:-50}
 
 CPU_MODEL=$(lscpu | grep "Model name" | cut -d ':' -f 2 | sed 's/^ *//')
 echo "[Client] CPU 型號：$CPU_MODEL"
@@ -71,6 +71,7 @@ RESPONSE=$(ssh ${USER}@${SERVER} "bash ~/test_server1.sh \"$CPU_MODEL\" $REQUIRE
 if [[ "$RESPONSE" == SUFFICIENT* ]]; then
     echo "[Client] Server 已有足夠測量資料，直接使用現有結果："
     echo "$RESPONSE" | sed '1d' > result.txt
+    cat result.txt
     echo "[Client] 結果已儲存至 result.txt"
     exit 0
     
@@ -81,7 +82,6 @@ elif [[ "$RESPONSE" == NEED_MORE* ]]; then
     
     echo "[Client] 當前測量次數：$CURRENT_COUNT"
     echo "[Client] 還需要測量：$NEEDED_COUNT 次"
-    echo "[Client] 準備補足剩餘測量..."
     
     MEASUREMENT_TIMES=$NEEDED_COUNT
 else
@@ -105,6 +105,8 @@ if [ "$MEASUREMENT_TIMES" -gt 0 ]; then
     fi
     cd core-to-core-latency
     cargo install core-to-core-latency
+    echo "export PATH=\"$HOME/.cargo/bin:$PATH\"" > $HOME/.bashrc
+    source $HOME/.bashrc
     
     echo "[Client] 準備開始 $MEASUREMENT_TIMES 次測量，設置進程暫停機制..."
     
