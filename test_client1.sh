@@ -3,7 +3,7 @@ SERVER="172.16.1.72"
 USER="yunhsihsu"
 
 # 檢查參數：需要的總測量次數（預設為5次）
-REQUIRED_MEASUREMENTS=${1:-50}
+REQUIRED_MEASUREMENTS=${1:-1}
 
 CPU_MODEL=$(lscpu | grep "Model name" | cut -d ':' -f 2 | sed 's/^ *//')
 echo "[Client] CPU 型號：$CPU_MODEL"
@@ -100,14 +100,6 @@ if [ "$MEASUREMENT_TIMES" -gt 0 ]; then
         source $HOME/.cargo/env
     fi
     
-    if [ ! -d "core-to-core-latency" ]; then
-        git clone https://github.com/nviennot/core-to-core-latency.git
-    fi
-    cd core-to-core-latency
-    cargo install core-to-core-latency
-    echo "export PATH=\"$HOME/.cargo/bin:$PATH\"" > $HOME/.bashrc
-    source $HOME/.bashrc
-    
     echo "[Client] 準備開始 $MEASUREMENT_TIMES 次測量，設置進程暫停機制..."
     
     # 設置陷阱以確保即使腳本異常退出也能恢復進程
@@ -126,14 +118,18 @@ if [ "$MEASUREMENT_TIMES" -gt 0 ]; then
         
         # 生成帶時間戳和序號的檔案名稱
         TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-        OUTPUT_FILE="output_${TIMESTAMP}_${i}.csv"
+	OUTPUT_DIR="core-to-core-latency"
+	OUTPUT_FILE="output_${TIMESTAMP}_${i}.csv"
+	OUTPUT_PATH="${OUTPUT_DIR}/${OUTPUT_FILE}"
         
         # 執行測量
         echo "[Client] 執行 core-to-core-latency..."
-        core-to-core-latency 5000 --csv > "$OUTPUT_FILE"
+        core-to-core-latency 5000 --csv > "$OUTPUT_PATH"
+
+	sudo chmod +777 "$OUTPUT_PATH"
         
         # 檢查檔案是否成功生成
-        if [ -f "$OUTPUT_FILE" ] && [ -s "$OUTPUT_FILE" ]; then
+        if [ -f "$OUTPUT_PATH" ] && [ -s "$OUTPUT_PATH" ]; then
             MEASUREMENT_FILES+=("$OUTPUT_FILE")
             echo "[Client] 第 $i 次測量完成：$OUTPUT_FILE"
         else
@@ -149,8 +145,6 @@ if [ "$MEASUREMENT_TIMES" -gt 0 ]; then
     
     # 測量完成後立即恢復進程
     resume_processes
-    
-    cd ..
     
     echo "[Client] 測量完成，共產生 ${#MEASUREMENT_FILES[@]} 個檔案"
     
