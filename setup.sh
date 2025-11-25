@@ -1,4 +1,6 @@
 #!/bin/bash
+SERVER="172.16.1.72"
+USER="yunhsihsu"
 
 #setup all need package 
 sudo apt update -y
@@ -22,5 +24,9 @@ if [ ! -d "tmp" ]; then
     mkdir tmp
 fi
 cd $HOME
+
+ssh-keygen -t ed25519
+ssh-copy-id -i ~/.ssh/id_ed25519.pub $USER@$SERVER
+
 
 echo "start measure"
