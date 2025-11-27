@@ -153,11 +153,17 @@ def write_tsp_order_to_csv(order, output_file):
         writer = csv.writer(f)
         writer.writerow(order)
 
+def write_route_to_csv(route, output_file):
+    with open(output_file, 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(route)
+
 def main():
     """主程式"""
     # CSV 檔案路徑
     csv_file = 'RON_TSP/tsp_order/output.csv'
-    output_file="RON_TSP/tsp_order.csv"
+    order_file="RON_TSP/tsp_order.csv"
+    route_file="RON_TSP/route.csv"
     try:
         # 讀取距離矩陣
         print(f"正在讀取 CSV 檔案: {csv_file}")
@@ -172,13 +178,14 @@ def main():
             if response.lower() != 'y':
                 return
         else:
-            print("✓ 矩陣驗證通過（對稱矩陣）")
+            print("矩陣驗證通過（對稱矩陣）")
         
         # 求解 TSP
         print("\n正在求解 TSP 問題...")
         route, total_distance = solve_tsp(distance_matrix, start_node=0)
         order=path_to_order(route)
-        write_tsp_order_to_csv(order, output_file)
+        write_route_to_csv(route[:-1], route_file)
+        write_tsp_order_to_csv(order, order_file)
         
         if route:
             print("\n=== 結果 ===")

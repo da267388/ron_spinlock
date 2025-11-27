@@ -4,7 +4,7 @@ BASE_PATH=$HOME
 CPU_MODEL="$1"
 REQUIRED_MEASUREMENTS="$2"  # 需要的總測量次數
 
-RESULT_DIR=$BASE_PATH/RON_TSP/tsp_order
+RESULT_DIR=$BASE_PATH/RON_TSP
 MEASUREMENTS_DIR=$BASE_PATH/RON_TSP/measurements
 mkdir -p "$RESULT_DIR"
 mkdir -p "$MEASUREMENTS_DIR"
@@ -58,21 +58,33 @@ if [ $TOTAL_MEASUREMENT_COUNT -ge $REQUIRED_MEASUREMENTS ]; then
         
         # 假設 toTSP.py 會產生 ~/RON_TSP/tsp_order.csv
         TSP_FILE="$BASE_PATH/RON_TSP/tsp_order.csv"
-        FINAL_TSP_FILE="$RESULT_DIR/$SAFE_MODEL/tsp_order.csv"
+        FINAL_TSP_FILE="$RESULT_DIR/tsp_order/$SAFE_MODEL/tsp_order.csv"
+        ROUTE_FILE="$BASE_PATH/RON_TSP/route.csv"
+        FINAL_ROUTE_FILE="$RESULT_DIR/route/$SAFE_MODEL/route.csv"
         
         if [ -f "$TSP_FILE" ]; then
             # 確保目錄存在
-            mkdir -p "$RESULT_DIR/$SAFE_MODEL"
+            mkdir -p "$RESULT_DIR/tsp_order/$SAFE_MODEL"
             mv "$TSP_FILE" "$FINAL_TSP_FILE"
             echo "[Server] TSP 結果已產生：$FINAL_TSP_FILE"
-            echo "[Server] 基於 $REQUIRED_MEASUREMENTS 次測量的平均結果"
-            
-            # 回傳結果給 client
-            paste -sd' ' "$FINAL_TSP_FILE"
         else
             echo "[Server] 錯誤：沒有產生 tsp_order.csv"
             exit 1
         fi
+        
+        if [ -f "$ROUTE_FILE" ]; then
+            # 確保目錄存在
+            mkdir -p "$RESULT_DIR/route/$SAFE_MODEL"
+            mv "$ROUTE_FILE" "$FINAL_ROUTE_FILE"
+            echo "[Server] TSP 結果已產生：$FINAL_ROUTE_FILE"            
+        else
+            echo "[Server] 錯誤：沒有產生 route.csv"
+            exit 1
+        fi
+        echo "[Server] 基於 $REQUIRED_MEASUREMENTS 次測量的平均結果"
+        # 回傳結果給 client
+        paste -sd' ' "$FINAL_TSP_FILE"
+        paste -sd' ' "$FINAL_ROUTE_FILE"
         
         # 清理臨時的平均檔案
         rm -f "$AVERAGE_FILE"

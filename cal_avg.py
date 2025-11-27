@@ -176,57 +176,13 @@ def calculate_average_matrices(measurement_folder, measurement_count):
                 avg_matrix[i][j] = 0
     
     print(f'\n極值過濾結果:')
-    print(f'  處理的位置數: {total_positions}')
-    print(f'  總測量值數: {total_values}')
-    print(f'  過濾的極值數: {outliers_filtered}')
+    #print(f'  處理的位置數: {total_positions}')
+    #print(f'  總測量值數: {total_values}')
+    #print(f'  過濾的極值數: {outliers_filtered}')
     if total_values > 0:
         actual_percent = (outliers_filtered / total_values) * 100
         print(f'  實際過濾比例: {actual_percent:.2f}%')
-        print(f'  保留的值數: {total_values - outliers_filtered}')
-    
-    # 計算變異係數
-    if len(matrices) > 1:
-        std_matrix = np.zeros((matrix_size, matrix_size))
-        
-        # 重新計算標準差（使用過濾後的值）
-        for i in range(matrix_size):
-            for j in range(matrix_size):
-                values = [m[i][j] for m in matrices]
-                if any(v > 0 for v in values):
-                    filtered_values = filter_outliers(values)
-                    if len(filtered_values) > 1:
-                        std_matrix[i][j] = np.std(filtered_values)
-        
-        # 找出高變異的位置
-        high_variance_count = 0
-        for i in range(avg_matrix.shape[0]):
-            for j in range(avg_matrix.shape[1]):
-                if avg_matrix[i][j] > 0:
-                    cv = (std_matrix[i][j] / avg_matrix[i][j]) * 100
-                    if cv > 5:
-                        high_variance_count += 1
-                        if high_variance_count <= 5:  # 只顯示前5個
-                            print(f'  高變異: ({i},{j}): 平均={avg_matrix[i][j]:.2f}, '
-                                  f'標準差={std_matrix[i][j]:.2f}, CV={cv:.1f}%')
-        
-        if high_variance_count > 5:
-            print(f'  ... 還有 {high_variance_count - 5} 個高變異位置')
-        
-        # 整體變異統計
-        non_zero_mask = avg_matrix > 0
-        if np.any(non_zero_mask):
-            cv_values = []
-            for i in range(matrix_size):
-                for j in range(matrix_size):
-                    if avg_matrix[i][j] > 0 and std_matrix[i][j] > 0:
-                        cv = (std_matrix[i][j] / avg_matrix[i][j]) * 100
-                        cv_values.append(cv)
-            
-            if cv_values:
-                print(f'\n變異係數統計 (過濾後):')
-                print(f'  平均: {np.mean(cv_values):.2f}%')
-                print(f'  最大: {np.max(cv_values):.2f}%')
-                print(f'  最小: {np.min(cv_values):.2f}%')
+        #print(f'  保留的值數: {total_values - outliers_filtered}')
     
     return avg_matrix
 
@@ -266,7 +222,7 @@ def write_matrix_csv(matrix, output_file):
             for row in matrix:
                 writer.writerow(row)
         
-        print(f'✅ 對稱矩陣CSV已儲存: {output_file}')
+        print(f'對稱矩陣CSV已儲存: {output_file}')
         return True
     except Exception as e:
         print(f'[錯誤] 寫入檔案失敗: {e}')
@@ -289,16 +245,16 @@ def print_matrix_info(matrix):
                 non_diagonal.append(matrix[i][j])
     
     if non_diagonal:
-        print(f'\n距離統計 (非對角線):')
-        print(f'  資料點數: {len(non_diagonal)}')
-        print(f'  最小: {np.min(non_diagonal):.2f}')
-        print(f'  最大: {np.max(non_diagonal):.2f}')
-        print(f'  平均: {np.mean(non_diagonal):.2f}')
-        print(f'  中位數: {np.median(non_diagonal):.2f}')
+        #print(f'\n距離統計 (非對角線):')
+        #print(f'  資料點數: {len(non_diagonal)}')
+        #print(f'  最小: {np.min(non_diagonal):.2f}')
+        #print(f'  最大: {np.max(non_diagonal):.2f}')
+        #print(f'  平均: {np.mean(non_diagonal):.2f}')
+        #print(f'  中位數: {np.median(non_diagonal):.2f}')
     
     # 檢查對稱性
     is_symmetric = np.allclose(matrix, matrix.T)
-    print(f'  對稱性檢查: {"✓ 對稱" if is_symmetric else "✗ 不對稱"}')
+    print(f'  對稱性檢查: {"對稱" if is_symmetric else "✗ 不對稱"}')
 
 def main():
     if len(sys.argv) < 3:
@@ -306,14 +262,6 @@ def main():
         print('\n範例:')
         print('  python3 calculate_average.py ~/RON_TSP/measurements/CPU_MODEL output.csv')
         print('  python3 calculate_average.py ~/RON_TSP/measurements/CPU_MODEL output.csv 5')
-        print('\n輸入格式: 下三角矩陣CSV（無行列標題）')
-        print('  0,0,0')
-        print('  10.5,0,0')
-        print('  15.3,20.1,0')
-        print('\n輸出格式: 完整對稱矩陣CSV（無行列標題）')
-        print('  0,10.5,15.3')
-        print('  10.5,0,20.1')
-        print('  15.3,20.1,0')
         sys.exit(1)
     
     measurement_folder = sys.argv[1]
@@ -352,26 +300,7 @@ def main():
     if write_matrix_csv(symmetric_matrix, output_file):
         # 打印統計資訊
         print_matrix_info(symmetric_matrix)
-        
-        # 顯示檔案預覽
-        print('\n=== 檔案預覽 (前5行) ===')
-        try:
-            with open(output_file, 'r') as f:
-                for i, line in enumerate(f):
-                    if i < 5:
-                        parts = line.strip().split(',')
-                        if len(parts) > 10:
-                            display = ','.join(parts[:10]) + ',...'
-                        else:
-                            display = line.strip()
-                        print(f'  {display}')
-                    else:
-                        print(f'  ...')
-                        break
-        except:
-            pass
-        
-        print(f'\n🎉 處理完成！')
+        print(f'\n處理完成！')
         print(f'輸出檔案: {output_file}')
         sys.exit(0)
     else:
